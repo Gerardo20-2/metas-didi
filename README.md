@@ -67,6 +67,20 @@ alcanzado* o *utilidad neta positiva* (con lo que queda limpio).
 adicionales de +1 a +5) que recalculan en vivo el neto simulado, el neto por jornada extra,
 el sobrecosto de combustible en esas jornadas y el impacto si el alza dura todo el mes.
 
+## Modelos predictivos
+
+| Modelo | Qué resuelve |
+| --- | --- |
+| **Monte Carlo** (1,000 iteraciones) | Probabilidad empírica de cerrar la meta. Muestrea cada día restante de una normal `N(μ, σ)` truncada en cero, generada por transformación de Box-Muller sobre el histórico de jornadas. Devuelve P5/P50/P95 y el rango de confianza al 90%. |
+| **Suavizado de Holt** (α=0.3, β=0.1) | Nivel y tendencia amortiguados para proyectar el bruto de la próxima jornada sin que un día atípico arrastre la estimación. |
+| **OEE de conducción** | `Disponibilidad × Desempeño × Calidad`: días trabajados sobre programados, $/hr real contra el benchmark configurable y margen neto sobre bruto. |
+| **Elasticidad del combustible** | Derivada discreta `Δneto/Δgasolina` sobre las jornadas ordenadas por gasto, con detección del punto de inflexión donde rodar más deja de pagarse. |
+
+El abanico P10–P90 del gráfico se traza analíticamente: la suma de *k* jornadas i.i.d. normales
+es normal con media `k·μ` y desviación `σ·√k`, así que el percentil sale de la cuantil normal sin
+guardar una matriz de 1,000 × días. El Monte Carlo usa una sola `Float64Array` de 1,000 totales:
+la simulación completa corre en ~2 ms.
+
 ## Control estadístico (SPC)
 
 Sobre la utilidad neta de las jornadas trabajadas: media (μ), desviación estándar (σ),
@@ -77,6 +91,9 @@ navegables desde el panel.
 
 ## Visualización (SVG puro, sin librerías)
 
+- **Campana de densidad**: histograma de las jornadas con la normal ajustada superpuesta,
+  marcando μ y la meta diaria media.
+- **Abanico Monte Carlo**: banda sombreada P10–P90 proyectada hasta el cierre del mes sobre la curva acumulada.
 - **Tacómetro radial** de 240° con graduación, arco animado por `stroke-dashoffset` y gradiente
   ámbar→esmeralda: mide la *eficiencia de pacing*, el avance de la meta contra el avance del calendario.
 - **Curva de acumulación** con interpolación Bézier cúbica (Catmull-Rom con los controles acotados
@@ -88,6 +105,19 @@ navegables desde el panel.
 
 ## Ergonomía en cabina
 
+Diseñada para operarse con una mano, con el teléfono en el soporte y el coche en movimiento.
+
+- **Dock de zona del pulgar:** todo lo accionable en marcha (dial de registro, switch de descanso,
+  deshacer y filtros) vive fijo en la franja inferior. Las gráficas y KPIs quedan arriba como
+  zona de lectura pasiva.
+- **Objetivos táctiles:** ningún control del dock baja de 54 px; el dial usa botones de 64 px
+  con separación generosa para tolerar el pulso en movimiento.
+- **Buffer de deshacer:** cualquier toque en falso se revierte durante 5 segundos desde el dock.
+- **Contraste AAA:** la tipografía crítica se mantiene por encima de 7:1 sobre `#0f172a`
+  (etiquetas en `slate-300` a 12:1, cifras en `emerald-400` a 9.3:1, negativos en `rose-300` a 9.4:1).
+- **Confirmación sonora:** pulsos sintetizados con `AudioContext` (440 Hz al tocar, 660→880 Hz al
+  registrar, doble tono en hitos), sin archivos externos y desactivables desde el menú.
+  Se combinan con patrones hápticos (`navigator.vibrate([15, 30, 15])` al cerrar un hito).
 - **HUD de cabina:** vista a pantalla completa para el soporte del vehículo, con tipografía
   monumental, anillo de progreso hacia la meta del día, cuánto falta, a cuántos viajes equivale
   y botones de inyección rápida de `+$50`, `+$100`, `+$150` y `+$200`.
@@ -121,7 +151,7 @@ cruzan el 100% reciben un destello y un glow esmeralda pulsante. Todo respeta
 ## Stack
 
 React 18, ReactDOM 18 y Babel Standalone desde cdnjs, más Tailwind CSS por CDN.
-Cero librerías de gráficos, iconos o animación: todo es SVG inline y CSS.
+Cero librerías de gráficos, iconos, animación ni matemáticas: todo es SVG inline, CSS y `Math` nativo.
 La matemática vive en hooks desacoplados del render (`useFinancialTelemetry`, `useBreakEven`,
 `useAnimatedNumber`); los cálculos pesados van en `useMemo`, los handlers en `useCallback` y las
 tarjetas están memoizadas con estadísticas diferidas (`useDeferredValue`) para que escribir no

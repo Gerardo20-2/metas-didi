@@ -109,7 +109,8 @@
             deprecPerKm: 0.35,  // depreciación del activo + seguro prorrateado
             avgTicket: 65,      // ticket promedio por viaje, para el calculador de turno
             maintenanceRate: 8, // % del bruto apartado para mantenimiento y amortización
-            taxRate: 2.5        // % del bruto apartado como resguardo fiscal / plataforma
+            taxRate: 2.5,       // % del bruto apartado como resguardo fiscal / plataforma
+            targetHourly: 120   // $/hr objetivo, benchmark del componente Desempeño del OEE
         };
 
         /* Campos monetarios/numéricos editables de cada jornada */
@@ -204,6 +205,62 @@
             return 'pendiente';
         };
 
+        /* ---------------------------------------------------------------------------
+           Realimentación sensorial: audio sintetizado + patrones hápticos.
+           Sin archivos externos; el AudioContext se crea en el primer gesto real del
+           usuario, que es cuando el navegador permite arrancarlo.
+           --------------------------------------------------------------------------- */
+        const audio = {
+            ctx: null,
+            enabled: true,
+            unlock() {
+                if (this.ctx) return this.ctx;
+                try {
+                    const Ctor = window.AudioContext || window.webkitAudioContext;
+                    if (!Ctor) return null;
+                    this.ctx = new Ctor();
+                } catch (err) {
+                    this.ctx = null;
+                }
+                return this.ctx;
+            },
+            tone(frequency, durationMs, peakGain) {
+                if (!this.enabled) return;
+                const ctx = this.unlock();
+                if (!ctx) return;
+                try {
+                    if (ctx.state === 'suspended') ctx.resume();
+                    const now = ctx.currentTime;
+                    const seconds = durationMs / 1000;
+                    const oscillator = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    oscillator.type = 'sine';
+                    oscillator.frequency.setValueAtTime(frequency, now);
+                    /* Envolvente corta: ataque de 4 ms y caída exponencial, sin clics */
+                    gain.gain.setValueAtTime(0.0001, now);
+                    gain.gain.exponentialRampToValueAtTime(peakGain, now + 0.004);
+                    gain.gain.exponentialRampToValueAtTime(0.0001, now + seconds);
+                    oscillator.connect(gain);
+                    gain.connect(ctx.destination);
+                    oscillator.start(now);
+                    oscillator.stop(now + seconds + 0.02);
+                    oscillator.onended = () => { try { gain.disconnect(); } catch (e) { /* ya liberado */ } };
+                } catch (err) { /* audio no disponible en este dispositivo */ }
+            }
+        };
+
+        const vibrate = (pattern) => {
+            try { if (navigator.vibrate) navigator.vibrate(pattern); } catch (err) { /* sin soporte */ }
+        };
+
+        /* Tres niveles de confirmación, audibles sin mirar la pantalla */
+        const feedback = {
+            tap() { audio.tone(440, 40, 0.04); vibrate(12); },
+            confirm() { audio.tone(660, 40, 0.05); vibrate(18); setTimeout(() => audio.tone(880, 40, 0.045), 46); },
+            milestone() { audio.tone(660, 45, 0.05); setTimeout(() => audio.tone(880, 60, 0.06), 55); vibrate([15, 30, 15]); },
+            warn() { audio.tone(300, 70, 0.05); vibrate([10, 40, 10]); }
+        };
+
         /* Micro-vibración háptica, limitada para no saturar al teclear */
         let lastHaptic = 0;
         const haptic = (ms = 15) => {
@@ -242,6 +299,7 @@
                 version: 2,
                 activeMonth: typeof base.activeMonth === 'string' ? base.activeMonth : null,
                 stealth: base.stealth === true,
+                sound: base.sound !== false,          // realimentación sonora activa por defecto
                 defaultGoals: mergedGoals,
                 costs: {
                     wearPerKm: Number.isFinite(Number(costs.wearPerKm)) ? Number(costs.wearPerKm) : DEFAULT_COSTS.wearPerKm,
@@ -250,7 +308,9 @@
                     maintenanceRate: Number.isFinite(Number(costs.maintenanceRate))
                         ? clamp(Number(costs.maintenanceRate), 0, 100) : DEFAULT_COSTS.maintenanceRate,
                     taxRate: Number.isFinite(Number(costs.taxRate))
-                        ? clamp(Number(costs.taxRate), 0, 100) : DEFAULT_COSTS.taxRate
+                        ? clamp(Number(costs.taxRate), 0, 100) : DEFAULT_COSTS.taxRate,
+                    targetHourly: Number(costs.targetHourly) > 0
+                        ? Number(costs.targetHourly) : DEFAULT_COSTS.targetHourly
                 }
             };
         };
@@ -724,6 +784,229 @@
         }, [days, costs, elapsedDays]);
 
         /* ============================================================================
+           5d. MODELOS PREDICTIVOS Y CONTROL ESTOCÁSTICO
+           ============================================================================ */
+        /* Normal estándar por transformación de Box-Muller.
+           Se cachea la segunda variante del par para no desperdiciar la mitad del cálculo. */
+        let spareNormal = null;
+        const standardNormal = () => {
+            if (spareNormal !== null) {
+                const value = spareNormal;
+                spareNormal = null;
+                return value;
+            }
+            let u1 = 0, u2 = 0;
+            while (u1 === 0) u1 = Math.random();   // evita log(0)
+            u2 = Math.random();
+            const radius = Math.sqrt(-2 * Math.log(u1));
+            const angle = 2 * Math.PI * u2;
+            spareNormal = radius * Math.sin(angle);
+            return radius * Math.cos(angle);
+        };
+
+        /* Percentil sobre una muestra ya ordenada, con interpolación lineal */
+        const percentileOf = (sortedSample, p) => {
+            const n = sortedSample.length;
+            if (n === 0) return 0;
+            if (n === 1) return sortedSample[0];
+            const position = clamp(p, 0, 1) * (n - 1);
+            const lower = Math.floor(position);
+            const upper = Math.ceil(position);
+            if (lower === upper) return sortedSample[lower];
+            const weight = position - lower;
+            return sortedSample[lower] * (1 - weight) + sortedSample[upper] * weight;
+        };
+
+        /* Monte Carlo sobre los días que quedan por trabajar.
+           Memoria acotada: una sola Float64Array de N totales, sin matriz N x días. */
+        const MONTE_CARLO_RUNS = 1000;
+        const runMonteCarlo = (mu, sigma, remainingDays, currentTotal, goal, runs = MONTE_CARLO_RUNS) => {
+            const days = Math.max(0, Math.round(remainingDays));
+            const mean = num(mu);
+            const sd = Math.max(num(sigma), 0);
+
+            if (days === 0 || mean <= 0) {
+                const deterministic = currentTotal;
+                return {
+                    runs: 0, days, mean, sd,
+                    probability: deterministic >= goal ? 100 : 0,
+                    p5: deterministic, p10: deterministic, p50: deterministic,
+                    p90: deterministic, p95: deterministic,
+                    expected: deterministic, goal, degenerate: true
+                };
+            }
+
+            const totals = new Float64Array(runs);
+            let successes = 0;
+            let sum = 0;
+
+            for (let i = 0; i < runs; i += 1) {
+                let total = currentTotal;
+                for (let d = 0; d < days; d += 1) {
+                    /* Normal truncada en cero: una jornada no puede facturar en negativo */
+                    total += Math.max(0, mean + sd * standardNormal());
+                }
+                totals[i] = total;
+                sum += total;
+                if (total >= goal) successes += 1;
+            }
+
+            totals.sort();
+            return {
+                runs, days, mean, sd, goal,
+                probability: (successes / runs) * 100,
+                p5: percentileOf(totals, 0.05),
+                p10: percentileOf(totals, 0.10),
+                p50: percentileOf(totals, 0.50),
+                p90: percentileOf(totals, 0.90),
+                p95: percentileOf(totals, 0.95),
+                expected: sum / runs,
+                degenerate: false
+            };
+        };
+
+        /* Banda del abanico: la suma de k jornadas i.i.d. normales es normal con
+           media k*mu y desviación sigma*sqrt(k), así que el percentil es analítico.
+           Evita guardar una matriz de N x días solo para dibujar la dispersión. */
+        const Z_SCORES = { p10: -1.2816, p90: 1.2816 };
+        const fanBand = (startValue, mu, sigma, steps) => {
+            const low = [], high = [], mid = [];
+            for (let k = 1; k <= steps; k += 1) {
+                const center = startValue + mu * k;
+                const spread = sigma * Math.sqrt(k);
+                low.push(Math.max(startValue, center + Z_SCORES.p10 * spread));
+                high.push(center + Z_SCORES.p90 * spread);
+                mid.push(center);
+            }
+            return { low, high, mid };
+        };
+
+        /* Suavizado exponencial doble (modelo lineal de Holt) */
+        const holtLinear = (series, alpha = 0.3, beta = 0.1) => {
+            const values = series.filter(v => Number.isFinite(v));
+            if (values.length === 0) return { level: 0, trend: 0, forecast: 0, fitted: [], n: 0 };
+            if (values.length === 1) {
+                return { level: values[0], trend: 0, forecast: values[0], fitted: [values[0]], n: 1 };
+            }
+
+            let level = values[0];
+            let trend = values[1] - values[0];
+            const fitted = [values[0]];
+
+            for (let t = 1; t < values.length; t += 1) {
+                const previousLevel = level;
+                level = alpha * values[t] + (1 - alpha) * (previousLevel + trend);
+                trend = beta * (level - previousLevel) + (1 - beta) * trend;
+                fitted.push(level + trend);
+            }
+
+            return { level, trend, forecast: Math.max(0, level + trend), fitted, n: values.length, alpha, beta };
+        };
+
+        /* OEE de conducción: Disponibilidad x Desempeño x Calidad financiera */
+        const computeOEE = (metrics, elapsedDays, days, costs) => {
+            let scheduled = 0, worked = 0;
+            days.forEach((day, index) => {
+                if (index >= elapsedDays) return;            // solo días ya transcurridos
+                if (num(day.goal) > 0) scheduled += 1;
+                if (num(day.earned) > 0) worked += 1;
+            });
+
+            const availability = scheduled > 0 ? clamp(worked / scheduled, 0, 1) : 0;
+            const target = num(costs.targetHourly) > 0 ? num(costs.targetHourly) : DEFAULT_COSTS.targetHourly;
+            const realHourly = metrics.grossPerHour;
+            const performance = realHourly !== null && target > 0 ? clamp(realHourly / target, 0, 1.5) : null;
+            const quality = metrics.totalEarned > 0 ? clamp(metrics.netProfit / metrics.totalEarned, 0, 1) : 0;
+
+            const measurable = performance !== null;
+            const oee = measurable ? availability * performance * quality : null;
+
+            return {
+                availability, performance, quality, oee, measurable,
+                scheduled, worked, target, realHourly,
+                verdict: !measurable ? 'Captura horas para medir el desempeño'
+                    : oee >= 0.55 ? 'Operación de clase alta'
+                    : oee >= 0.35 ? 'Operación competente'
+                    : oee >= 0.18 ? 'Margen de mejora amplio'
+                    : 'Operación por debajo de su potencial'
+            };
+        };
+
+        /* Elasticidad del combustible: derivada discreta del retorno marginal.
+           Ordena las jornadas por gasto en gasolina y mide cuánto neto añade cada peso extra. */
+        const computeFuelElasticity = (computed) => {
+            const points = computed
+                .filter(c => c.earned > 0 && c.gas > 0)
+                .map(c => ({ gas: c.gas, net: c.trueNet }))
+                .sort((a, b) => a.gas - b.gas);
+
+            if (points.length < 3) {
+                return { samples: points.length, marginal: [], avgMarginal: null, inflection: null, elasticity: null };
+            }
+
+            const marginal = [];
+            for (let i = 1; i < points.length; i += 1) {
+                const deltaGas = points[i].gas - points[i - 1].gas;
+                if (deltaGas <= 0.01) continue;
+                marginal.push({
+                    gas: points[i].gas,
+                    ratio: (points[i].net - points[i - 1].net) / deltaGas
+                });
+            }
+            if (marginal.length === 0) {
+                return { samples: points.length, marginal: [], avgMarginal: null, inflection: null, elasticity: null };
+            }
+
+            const avgMarginal = marginal.reduce((acc, m) => acc + m.ratio, 0) / marginal.length;
+            /* Punto de inflexión: primer tramo donde un peso más de gasolina deja de pagarse */
+            const inflection = marginal.find(m => m.ratio < 0) || null;
+
+            /* Elasticidad arco entre la jornada más barata y la más cara en combustible */
+            const first = points[0], last = points[points.length - 1];
+            const gasChange = (last.gas - first.gas) / ((last.gas + first.gas) / 2);
+            const netChange = (last.net - first.net) / (Math.abs(last.net + first.net) / 2 || 1);
+            const elasticity = gasChange !== 0 ? netChange / gasChange : null;
+
+            return { samples: points.length, marginal, avgMarginal, inflection, elasticity };
+        };
+
+        /* Hook: envuelve los modelos pesados y los memoiza sobre la lista diferida */
+        const usePredictiveModels = (days, metrics, costs, elapsedDays) => useMemo(() => {
+            const netSeries = [];
+            const grossSeries = [];
+            days.forEach((day, index) => {
+                const c = metrics.computed[index];
+                if (c && c.earned > 0) {
+                    netSeries.push(c.trueNet);
+                    grossSeries.push(c.earned);
+                }
+            });
+
+            const worked = grossSeries.length;
+            const mu = worked > 0 ? grossSeries.reduce((a, b) => a + b, 0) / worked : 0;
+            const variance = worked > 0
+                ? grossSeries.reduce((acc, v) => acc + Math.pow(v - mu, 2), 0) / worked
+                : 0;
+            const sigma = Math.sqrt(variance);
+
+            const started = performance && performance.now ? performance.now() : 0;
+            const monteCarlo = runMonteCarlo(mu, sigma, metrics.remainingDays,
+                                             metrics.totalEarned, metrics.totalGoal);
+            const elapsedMs = performance && performance.now ? performance.now() - started : 0;
+
+            const holt = holtLinear(grossSeries);
+            const holtNet = holtLinear(netSeries);
+            const oee = computeOEE(metrics, elapsedDays, days, costs);
+            const fuel = computeFuelElasticity(metrics.computed);
+
+            return {
+                mu, sigma, worked, monteCarlo, holt, holtNet, oee, fuel, elapsedMs,
+                cv: mu > 0 ? (sigma / mu) * 100 : 0,
+                enoughData: worked >= 3
+            };
+        }, [days, metrics, costs, elapsedDays]);
+
+        /* ============================================================================
            6. ICONOGRAFÍA SVG INLINE
            ============================================================================ */
         const Icon = ({ path, size = 18, className = '', strokeWidth = 1.8 }) => (
@@ -785,7 +1068,7 @@
             };
             return (
                 <div className="bg-slate-900 rounded-xl border border-slate-800 px-3 py-2.5">
-                    <div className="flex items-center gap-1.5 text-slate-500 mb-1">
+                    <div className="flex items-center gap-1.5 text-slate-300 mb-1">
                         {icon}
                         <span className="text-[9px] uppercase tracking-[0.12em] font-bold truncate">{label}</span>
                     </div>
@@ -805,7 +1088,7 @@
         const MeterRow = ({ label, value, display, color }) => (
             <div className="space-y-1">
                 <div className="flex justify-between items-baseline text-[11px] gap-2">
-                    <span className="text-slate-400 font-medium truncate">{label}</span>
+                    <span className="text-slate-300 font-medium truncate">{label}</span>
                     <span className="text-slate-200 font-bold num shrink-0">{display}</span>
                 </div>
                 <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
@@ -882,7 +1165,7 @@
         /* ============================================================================
            8. CURVA ACUMULATIVA CON INSPECTOR TÁCTIL (SCRUBBING)
            ============================================================================ */
-        function CumulativeChart({ days, metrics, todayIndex }) {
+        function CumulativeChart({ days, metrics, todayIndex, prediction }) {
             const { cash, cashShort, stealth } = useCash();
             const [cursor, setCursor] = useState(null);
             const svgRef = useRef(null);
@@ -897,7 +1180,17 @@
             const totalReal = cumulativeReal[count - 1] || 0;
 
             const realEnd = clamp(Math.max(lastWorkedIndex, todayIndex >= 0 ? todayIndex : 0), 0, count - 1);
-            const maxY = Math.max(totalGoal, totalReal, projectedGross, 1);
+
+            /* Abanico probabilístico: percentil 10 a 90 de la acumulación futura */
+            const fan = useMemo(() => {
+                const steps = count - 1 - realEnd;
+                if (!prediction || !prediction.enoughData || steps <= 0 || prediction.mu <= 0) return null;
+                const band = fanBand(cumulativeReal[realEnd] || 0, prediction.mu, prediction.sigma, steps);
+                return { ...band, steps };
+            }, [prediction, count, realEnd, cumulativeReal]);
+
+            const maxY = Math.max(totalGoal, totalReal, projectedGross,
+                                  fan ? fan.high[fan.high.length - 1] : 0, 1);
 
             const x = useCallback((i) => padL + (i / Math.max(count - 1, 1)) * (W - padL - padR), [count]);
             const y = useCallback((v) => H - padB - (clamp(v / maxY, 0, 1)) * (H - padT - padB), [maxY]);
@@ -911,8 +1204,22 @@
                 const projPath = (projectedGross > 0 && realEnd < count - 1)
                     ? `M${x(realEnd).toFixed(1)},${y(cumulativeReal[realEnd]).toFixed(1)} L${x(count - 1).toFixed(1)},${y(projectedGross).toFixed(1)}`
                     : null;
-                return { goalPath, realPath, areaPath, projPath };
-            }, [cumulativeGoal, cumulativeReal, realEnd, count, projectedGross, x, y]);
+
+                let fanPath = null;
+                let fanMidPath = null;
+                if (fan) {
+                    const anchorPoint = { x: x(realEnd), y: y(cumulativeReal[realEnd] || 0) };
+                    const upper = [anchorPoint].concat(fan.high.map((v, i) => ({ x: x(realEnd + 1 + i), y: y(v) })));
+                    const lower = [anchorPoint].concat(fan.low.map((v, i) => ({ x: x(realEnd + 1 + i), y: y(v) })));
+                    const upperPath = smoothPath(upper);
+                    const lowerReversed = lower.slice().reverse();
+                    const lowerPath = smoothPath(lowerReversed).replace(/^M/, 'L');
+                    fanPath = `${upperPath} ${lowerPath} Z`;
+                    fanMidPath = smoothPath([anchorPoint].concat(fan.mid.map((v, i) => ({ x: x(realEnd + 1 + i), y: y(v) }))));
+                }
+
+                return { goalPath, realPath, areaPath, projPath, fanPath, fanMidPath };
+            }, [cumulativeGoal, cumulativeReal, realEnd, count, projectedGross, fan, x, y]);
 
             const indexFromEvent = useCallback((clientX) => {
                 const node = svgRef.current;
@@ -977,6 +1284,13 @@
                             ))}
                             <line x1={padL} x2={W - padR} y1={y(0)} y2={y(0)} stroke={COLORS.slate700} strokeWidth="1" fill="none" />
 
+                            {paths.fanPath && (
+                                <path d={paths.fanPath} fill="url(#fanFill)" stroke="none" />
+                            )}
+                            {paths.fanMidPath && (
+                                <path d={paths.fanMidPath} fill="none" stroke={COLORS.cyan}
+                                      strokeWidth="1.2" strokeOpacity="0.55" strokeDasharray="1 4" strokeLinecap="round" />
+                            )}
                             <path d={paths.areaPath} fill="url(#realFill)" stroke="none" />
                             <path d={paths.goalPath} fill="none" stroke={COLORS.slate500} strokeWidth="1.9"
                                   strokeDasharray="5 4" strokeLinecap="round" />
@@ -1038,6 +1352,16 @@
                         <Legend color={COLORS.emerald} label="Real" value={cash(totalReal, 0)} />
                         <Legend color={COLORS.slate500} dashed label="Meta" value={cash(totalGoal, 0)} />
                         {paths.projPath && <Legend color={COLORS.cyan} dashed label="Proyección" value={cash(projectedGross, 0)} />}
+                        {fan && (
+                            <span className="flex items-center gap-1.5 text-[11px]">
+                                <span className="inline-block w-4 h-2 rounded-sm shrink-0"
+                                      style={{ backgroundColor: COLORS.cyan, opacity: 0.28 }}></span>
+                                <span className="text-slate-400">Abanico P10–P90</span>
+                                <span className="text-slate-200 font-semibold num">
+                                    {cash(fan.low[fan.low.length - 1], 0)} – {cash(fan.high[fan.high.length - 1], 0)}
+                                </span>
+                            </span>
+                        )}
                     </div>
                 </SectionCard>
             );
@@ -1497,7 +1821,7 @@
                                         </span>
                                     )}
                                 </div>
-                                <p className="text-slate-500 text-[10px] uppercase tracking-wider font-bold mt-0.5">{day.dayName}</p>
+                                <p className="text-slate-300 text-[10px] uppercase tracking-wider font-bold mt-0.5">{day.dayName}</p>
                             </div>
                             <div className="text-right shrink-0">
                                 <span className={`text-lg font-bold num ${
@@ -1505,7 +1829,7 @@
                                     : c.status === 'pendiente' ? 'text-amber-400' : 'text-slate-600'}`}>
                                     {c.percentage.toFixed(0)}%
                                 </span>
-                                <p className="text-[9px] uppercase tracking-wider text-slate-600 font-bold">cumplim.</p>
+                                <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">cumplim.</p>
                             </div>
                         </div>
 
@@ -1538,7 +1862,7 @@
                         )}
 
                         <div className="flex items-center justify-between gap-2 mb-2.5">
-                            <span className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">Neto real</span>
+                            <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">Neto real</span>
                             <span className="flex items-baseline gap-2">
                                 {c.earned > 0 && (
                                     <span className={`text-[10px] num font-semibold ${
@@ -1622,9 +1946,9 @@
         const DerivedStat = ({ label, value, hint, tone = 'default' }) => (
             <div className={`rounded-lg border px-2 py-1.5 ${
                 tone === 'warn' ? 'bg-amber-950/25 border-amber-900/50' : 'bg-slate-800/40 border-slate-800'}`}>
-                <p className="text-[9px] uppercase tracking-wider text-slate-500 font-bold truncate">{label}</p>
+                <p className="text-[9px] uppercase tracking-wider text-slate-300 font-bold truncate">{label}</p>
                 <p className={`text-[13px] font-bold num ${tone === 'warn' ? 'text-amber-300' : 'text-slate-100'}`}>{value}</p>
-                {hint && <p className="text-[9px] text-slate-600 num truncate">{hint}</p>}
+                {hint && <p className="text-[9px] text-slate-400 num truncate">{hint}</p>}
             </div>
         );
 
@@ -1806,7 +2130,7 @@
                                 <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-3 space-y-1.5">
                                     <p className="flex justify-between text-[11px]">
                                         <span className="text-slate-400">Neto real del día</span>
-                                        <span className={`font-bold num ${c.trueNet >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{cash(c.trueNet)}</span>
+                                        <span className={`font-bold num ${c.trueNet >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>{cash(c.trueNet)}</span>
                                     </p>
                                     <p className="flex justify-between text-[11px]">
                                         <span className="text-slate-400">Cuota diaria pendiente del mes</span>
@@ -1844,7 +2168,8 @@
 
         function ToolsSheet({
             open, onClose, costs, onCostChange, monthName, dayCount, storedMonths, lastSavedAt,
-            onExportMonth, onExportAll, onImportFile, onExportCsv, onCopySummary, onClearMonth
+            onExportMonth, onExportAll, onImportFile, onExportCsv, onCopySummary, onClearMonth,
+            soundOn, onToggleSound
         }) {
             const [armed, setArmed] = useState(false);
             const fileRef = useRef(null);
@@ -1902,11 +2227,13 @@
                         <p className="text-[10px] uppercase tracking-[0.12em] font-bold text-slate-500 mt-5 mb-2">
                             Sobres virtuales (% del bruto)
                         </p>
-                        <div className="grid grid-cols-2 gap-2">
+                        <div className="grid grid-cols-3 gap-2">
                             <MoneyField id="fund-maintenance" label="Mantenimiento" tone="ops" prefix="%" compact
                                         value={costs.maintenanceRate} onChange={(v) => onCostChange('maintenanceRate', v)} />
                             <MoneyField id="fund-tax" label="Resguardo fiscal" tone="unit" prefix="%" compact
                                         value={costs.taxRate} onChange={(v) => onCostChange('taxRate', v)} />
+                            <MoneyField id="target-hourly" label="Meta $/hr" tone="goal" compact
+                                        value={costs.targetHourly} onChange={(v) => onCostChange('targetHourly', v)} />
                         </div>
                         <p className="text-[11px] text-slate-500 mt-2 num">
                             Se aparta <span className="text-violet-300 font-bold">
@@ -1934,6 +2261,22 @@
                             <SheetButton onClick={onCopySummary} icon={<IconClipboard size={18} />} accent="amber"
                                          title="Copiar resumen ejecutivo" detail="Texto listo para WhatsApp o notas" />
                         </div>
+
+                        {/* Realimentación sensorial */}
+                        <p className="text-[10px] uppercase tracking-[0.12em] font-bold text-slate-400 mt-5 mb-2">Realimentación</p>
+                        <button onClick={onToggleSound} role="switch" aria-checked={soundOn}
+                                style={{ minHeight: '56px' }}
+                                className="focus-ring press w-full flex items-center justify-between gap-3 bg-slate-800/50 hover:bg-slate-800 border border-slate-800 rounded-xl px-3 transition-colors">
+                            <span className="flex-1 text-left">
+                                <span className="block text-sm font-semibold text-slate-100">Confirmación sonora</span>
+                                <span className="block text-[11px] text-slate-400">Pulsos de 440–880 Hz al registrar sin mirar</span>
+                            </span>
+                            <span className={`shrink-0 w-12 h-7 rounded-full border transition-colors relative ${
+                                soundOn ? 'bg-emerald-600/40 border-emerald-500/60' : 'bg-slate-700 border-slate-600'}`}>
+                                <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-slate-100 transition-transform duration-200 ${
+                                    soundOn ? 'translate-x-6' : 'translate-x-0.5'}`}></span>
+                            </span>
+                        </button>
 
                         {/* Zona sensible */}
                         <p className="text-[10px] uppercase tracking-[0.12em] font-bold text-slate-500 mt-5 mb-2">Zona sensible</p>
@@ -2057,6 +2400,268 @@
         }
 
         /* ============================================================================
+           15b-2. DENSIDAD DE PROBABILIDAD (CAMPANA GAUSSIANA)
+           ============================================================================ */
+        function DensityChart({ samples, mu, sigma, targetDaily }) {
+            const { cashShort, stealth } = useCash();
+            const W = 320, H = 96, PAD_B = 16, PAD_T = 8;
+
+            const model = useMemo(() => {
+                if (samples.length < 2 || sigma <= 0) return null;
+                const lo = Math.max(0, mu - 3 * sigma);
+                const hi = Math.max(mu + 3 * sigma, targetDaily * 1.1, lo + 1);
+                const bins = 9;
+                const width = (hi - lo) / bins;
+                const counts = new Array(bins).fill(0);
+                samples.forEach(value => {
+                    const index = clamp(Math.floor((value - lo) / width), 0, bins - 1);
+                    counts[index] += 1;
+                });
+                const maxCount = Math.max(...counts, 1);
+
+                /* Curva normal ajustada, escalada al alto del histograma */
+                const curve = [];
+                const steps = 48;
+                const peak = 1 / (sigma * Math.sqrt(2 * Math.PI));
+                for (let i = 0; i <= steps; i += 1) {
+                    const value = lo + ((hi - lo) * i) / steps;
+                    const density = (1 / (sigma * Math.sqrt(2 * Math.PI)))
+                        * Math.exp(-0.5 * Math.pow((value - mu) / sigma, 2));
+                    curve.push({ value, ratio: density / peak });
+                }
+                return { lo, hi, width, counts, maxCount, curve, bins };
+            }, [samples, mu, sigma, targetDaily]);
+
+            if (!model) {
+                return (
+                    <p className="text-[11px] text-slate-400">
+                        Registra al menos dos jornadas para trazar la distribución de ingresos.
+                    </p>
+                );
+            }
+
+            const scaleX = (value) => ((value - model.lo) / (model.hi - model.lo)) * W;
+            const barH = (count) => (count / model.maxCount) * (H - PAD_B - PAD_T);
+            const curvePath = model.curve
+                .map((point, i) => `${i === 0 ? 'M' : 'L'}${scaleX(point.value).toFixed(1)},${(H - PAD_B - point.ratio * (H - PAD_B - PAD_T)).toFixed(1)}`)
+                .join(' ');
+
+            return (
+                <div>
+                    <svg viewBox={`0 0 ${W} ${H}`} width="100%" role="img"
+                         className="block w-full h-auto"
+                         aria-label="Distribución de ingresos diarios contra la meta media esperada">
+                        {model.counts.map((count, i) => {
+                            const x0 = scaleX(model.lo + i * model.width);
+                            const barWidth = (W / model.bins) - 3;
+                            const height = barH(count);
+                            return (
+                                <rect key={`bin-${i}`} x={x0 + 1.5} y={H - PAD_B - height}
+                                      width={Math.max(barWidth, 2)} height={Math.max(height, count > 0 ? 2 : 0)}
+                                      rx="2" fill={COLORS.emerald} fillOpacity={count > 0 ? 0.35 : 0} />
+                            );
+                        })}
+
+                        <path d={curvePath} fill="none" stroke={COLORS.cyan} strokeWidth="1.8" strokeLinecap="round" />
+
+                        <line x1={scaleX(mu)} x2={scaleX(mu)} y1={PAD_T - 4} y2={H - PAD_B}
+                              stroke={COLORS.emerald} strokeWidth="1.6" />
+                        <text x={clamp(scaleX(mu), 16, W - 16)} y={PAD_T - 1} fill={COLORS.emerald}
+                              fontSize="8.5" fontWeight="700" textAnchor="middle" fontFamily="system-ui, sans-serif">
+                            μ {stealth ? '•••' : cashShort(mu)}
+                        </text>
+
+                        {targetDaily > 0 && targetDaily < model.hi && (
+                            <>
+                                <line x1={scaleX(targetDaily)} x2={scaleX(targetDaily)} y1={PAD_T - 4} y2={H - PAD_B}
+                                      stroke={COLORS.amber} strokeWidth="1.6" strokeDasharray="3 3" />
+                                <text x={clamp(scaleX(targetDaily), 20, W - 20)} y={H - 4} fill={COLORS.amber}
+                                      fontSize="8.5" fontWeight="700" textAnchor="middle" fontFamily="system-ui, sans-serif">
+                                    meta {stealth ? '•••' : cashShort(targetDaily)}
+                                </text>
+                            </>
+                        )}
+
+                        <line x1="0" x2={W} y1={H - PAD_B} y2={H - PAD_B} stroke={COLORS.slate700} strokeWidth="1" />
+                    </svg>
+                </div>
+            );
+        }
+
+        /* ============================================================================
+           15b-3. PANEL PREDICTIVO: MONTE CARLO, HOLT, OEE Y ELASTICIDAD
+           ============================================================================ */
+        function PredictivePanel({ prediction, metrics, samples, targetDaily }) {
+            const { cash } = useCash();
+            const [open, setOpen] = useState(false);
+            const mc = prediction.monteCarlo;
+            const probability = mc.probability;
+
+            const probTone = probability >= 70 ? 'text-emerald-400'
+                : probability >= 40 ? 'text-amber-400' : 'text-rose-400';
+
+            return (
+                <section className="bg-slate-900 rounded-2xl border border-slate-800 p-4">
+                    <div className="flex items-start justify-between gap-3 mb-3">
+                        <div className="min-w-0">
+                            <h2 className="text-slate-100 text-sm font-semibold tracking-tight">Pronóstico estocástico</h2>
+                            <p className="text-slate-400 text-[11px]">
+                                {prediction.enoughData
+                                    ? `${mc.runs.toLocaleString('es-MX')} simulaciones sobre ${mc.days} ${mc.days === 1 ? 'día restante' : 'días restantes'}`
+                                    : 'Necesita al menos 3 jornadas registradas'}
+                            </p>
+                        </div>
+                        <StatPill label="Monte Carlo" value={`${prediction.elapsedMs.toFixed(1)} ms`} tone="sky" />
+                    </div>
+
+                    {!prediction.enoughData ? (
+                        <p className="text-[12px] text-slate-400">
+                            Captura tres jornadas para que el modelo tenga media y desviación con las que simular
+                            el resto del mes.
+                        </p>
+                    ) : (
+                        <>
+                            <div className="flex items-end justify-between gap-3">
+                                <div>
+                                    <p className="text-[10px] uppercase tracking-[0.14em] text-slate-400 font-bold">
+                                        Probabilidad de cerrar la meta
+                                    </p>
+                                    <p className={`text-4xl font-extrabold num leading-none mt-1 ${probTone}`}>
+                                        {probability.toFixed(1)}%
+                                    </p>
+                                </div>
+                                <div className="text-right">
+                                    <p className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">Esperado</p>
+                                    <p className="text-lg font-bold num text-slate-100">{cash(mc.expected, 0)}</p>
+                                    <p className="text-[10px] text-slate-400 num">meta {cash(mc.goal, 0)}</p>
+                                </div>
+                            </div>
+
+                            <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden mt-3">
+                                <div className={`h-2 rounded-full transition-all duration-700 ${
+                                    probability >= 70 ? 'bg-emerald-500' : probability >= 40 ? 'bg-amber-500' : 'bg-rose-500'}`}
+                                     style={{ width: `${clamp(probability, 0, 100)}%` }}></div>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-2 mt-3">
+                                <div className="rounded-xl bg-rose-950/20 border border-rose-900/40 px-3 py-2">
+                                    <p className="text-[9px] uppercase tracking-wider text-rose-400 font-bold">Pesimista · P5</p>
+                                    <p className="text-base font-bold num text-rose-300">{cash(mc.p5, 0)}</p>
+                                </div>
+                                <div className="rounded-xl bg-emerald-950/20 border border-emerald-900/40 px-3 py-2">
+                                    <p className="text-[9px] uppercase tracking-wider text-emerald-400 font-bold">Optimista · P95</p>
+                                    <p className="text-base font-bold num text-emerald-300">{cash(mc.p95, 0)}</p>
+                                </div>
+                            </div>
+                            <p className="text-[10px] text-slate-400 num mt-1.5 text-center">
+                                Rango de confianza al 90% · mediana {cash(mc.p50, 0)}
+                            </p>
+
+                            <div className="mt-4 pt-3 border-t border-slate-800">
+                                <DensityChart samples={samples} mu={prediction.mu} sigma={prediction.sigma}
+                                              targetDaily={targetDaily} />
+                                <p className="text-[10px] text-slate-400 text-center num">
+                                    Distribución de jornadas · μ {cash(prediction.mu, 0)} · σ {cash(prediction.sigma, 0)}
+                                </p>
+                            </div>
+
+                            <button onClick={() => { setOpen(o => !o); feedback.tap(); }} aria-expanded={open}
+                                    className="focus-ring press w-full mt-3 flex items-center justify-between gap-2 rounded-xl bg-slate-800/50 border border-slate-800 px-3 py-3 transition-colors">
+                                <span className="text-[11px] font-bold uppercase tracking-wider text-slate-300">
+                                    Modelos avanzados
+                                </span>
+                                <span className={`text-slate-400 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}>
+                                    <IconChevronD size={16} />
+                                </span>
+                            </button>
+
+                            {open && (
+                                <div className="mt-3 space-y-3 fade-in">
+                                    {/* Holt */}
+                                    <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3 py-2.5">
+                                        <div className="flex items-center justify-between gap-2">
+                                            <span className="text-[11px] font-bold text-sky-300">Suavizado de Holt</span>
+                                            <span className="text-[10px] text-slate-400 num">α 0.3 · β 0.1</span>
+                                        </div>
+                                        <div className="grid grid-cols-3 gap-2 mt-2">
+                                            <MiniStat label="Nivel" value={cash(prediction.holt.level, 0)} />
+                                            <MiniStat label="Tendencia" value={`${prediction.holt.trend >= 0 ? '+' : ''}${cash(prediction.holt.trend, 0)}`}
+                                                      tone={prediction.holt.trend >= 0 ? 'text-emerald-400' : 'text-rose-300'} />
+                                            <MiniStat label="Mañana" value={cash(prediction.holt.forecast, 0)} tone="text-sky-300" />
+                                        </div>
+                                        <p className="text-[10px] text-slate-400 mt-1.5">
+                                            Proyección del bruto de la próxima jornada, amortiguando días atípicos.
+                                        </p>
+                                    </div>
+
+                                    {/* OEE */}
+                                    <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3 py-2.5">
+                                        <div className="flex items-center justify-between gap-2">
+                                            <span className="text-[11px] font-bold text-violet-300">OEE de conducción</span>
+                                            <span className={`text-base font-bold num ${
+                                                prediction.oee.oee === null ? 'text-slate-400'
+                                                : prediction.oee.oee >= 0.35 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                                                {prediction.oee.oee === null ? '—' : pctText(prediction.oee.oee * 100, 1)}
+                                            </span>
+                                        </div>
+                                        <div className="grid grid-cols-3 gap-2 mt-2">
+                                            <MiniStat label="Disponibilidad" value={pctText(prediction.oee.availability * 100, 0)}
+                                                      hint={`${prediction.oee.worked}/${prediction.oee.scheduled} días`} />
+                                            <MiniStat label="Desempeño"
+                                                      value={prediction.oee.performance === null ? '—' : pctText(prediction.oee.performance * 100, 0)}
+                                                      hint={`vs ${cash(prediction.oee.target, 0)}/h`} />
+                                            <MiniStat label="Calidad" value={pctText(prediction.oee.quality * 100, 0)}
+                                                      hint="margen neto" />
+                                        </div>
+                                        <p className="text-[10px] text-slate-400 mt-1.5">{prediction.oee.verdict}</p>
+                                    </div>
+
+                                    {/* Elasticidad */}
+                                    <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3 py-2.5">
+                                        <div className="flex items-center justify-between gap-2">
+                                            <span className="text-[11px] font-bold text-amber-300">Rendimiento marginal del combustible</span>
+                                        </div>
+                                        {prediction.fuel.avgMarginal === null ? (
+                                            <p className="text-[11px] text-slate-400 mt-1">
+                                                Necesita tres jornadas con gasolina registrada.
+                                            </p>
+                                        ) : (
+                                            <>
+                                                <div className="grid grid-cols-2 gap-2 mt-2">
+                                                    <MiniStat label="Δ Neto / Δ Gasolina"
+                                                              value={`${prediction.fuel.avgMarginal.toFixed(2)}×`}
+                                                              tone={prediction.fuel.avgMarginal >= 1 ? 'text-emerald-400' : 'text-amber-400'}
+                                                              hint="peso neto por peso de gas" />
+                                                    <MiniStat label="Elasticidad arco"
+                                                              value={prediction.fuel.elasticity === null ? '—' : prediction.fuel.elasticity.toFixed(2)}
+                                                              hint="sensibilidad del neto" />
+                                                </div>
+                                                <p className={`text-[10px] mt-1.5 ${
+                                                    prediction.fuel.inflection ? 'text-amber-300' : 'text-slate-400'}`}>
+                                                    {prediction.fuel.inflection
+                                                        ? `Punto de inflexión cerca de ${cash(prediction.fuel.inflection.gas, 0)} de gasolina: más allá, rodar añade desgaste sin pagar el neto.`
+                                                        : 'Cada peso extra de gasolina sigue devolviendo neto positivo: no hay rendimientos decrecientes en el rango registrado.'}
+                                                </p>
+                                            </>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+                        </>
+                    )}
+                </section>
+            );
+        }
+
+        const MiniStat = ({ label, value, hint, tone = 'text-slate-100' }) => (
+            <div className="rounded-lg bg-slate-900/70 border border-slate-800 px-2 py-1.5">
+                <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold truncate">{label}</p>
+                <p className={`text-[13px] font-bold num ${tone}`}>{value}</p>
+                {hint && <p className="text-[9px] text-slate-500 num truncate">{hint}</p>}
+            </div>
+        );
+
+        /* ============================================================================
            15c. SOBRES VIRTUALES (SINKING FUNDS)
            ============================================================================ */
         function SinkingFundsPanel({ funds, netProfit, grossIncome }) {
@@ -2099,7 +2704,7 @@
                                     <span className="block text-[10px] text-slate-500 num">Neto real menos provisiones</span>
                                 </span>
                                 <span className={`text-base font-bold num shrink-0 ${
-                                    funds.freeCash >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                    funds.freeCash >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>
                                     {cash(funds.freeCash)}
                                 </span>
                             </div>
@@ -2141,7 +2746,7 @@
             const scenario = useMemo(
                 () => simulateScenario(metrics, fuelDelta, extraDays), [metrics, fuelDelta, extraDays]);
 
-            const deltaTone = scenario.deltaNet >= 0 ? 'text-emerald-400' : 'text-rose-400';
+            const deltaTone = scenario.deltaNet >= 0 ? 'text-emerald-400' : 'text-rose-300';
 
             return (
                 <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
@@ -2183,7 +2788,7 @@
                                             <input id="sim-fuel" type="range" min="-15" max="25" step="1" value={fuelDelta}
                                                    onChange={(e) => setFuelDelta(Number(e.target.value))}
                                                    className="w-full focus-ring" />
-                                            <div className="flex justify-between text-[9px] text-slate-600 num mt-0.5">
+                                            <div className="flex justify-between text-[9px] text-slate-400 num mt-0.5">
                                                 <span>−15%</span><span>Actual</span><span>+25%</span>
                                             </div>
                                         </div>
@@ -2200,7 +2805,7 @@
                                             <input id="sim-days" type="range" min="1" max="5" step="1" value={extraDays}
                                                    onChange={(e) => setExtraDays(Number(e.target.value))}
                                                    className="w-full focus-ring" />
-                                            <div className="flex justify-between text-[9px] text-slate-600 num mt-0.5">
+                                            <div className="flex justify-between text-[9px] text-slate-400 num mt-0.5">
                                                 <span>+1</span><span>+3</span><span>+5</span>
                                             </div>
                                         </div>
@@ -2217,7 +2822,7 @@
                                         <div className="rounded-xl bg-slate-800/50 border border-slate-800 px-3 py-2.5">
                                             <p className="text-[9px] uppercase tracking-wider text-slate-500 font-bold">Neto por jornada extra</p>
                                             <p className={`text-lg font-bold num ${
-                                                scenario.netPerExtraDay >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                                scenario.netPerExtraDay >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>
                                                 {cash(scenario.netPerExtraDay, 0)}
                                             </p>
                                             <p className="text-[10px] text-slate-500 num">
@@ -2351,7 +2956,7 @@
                                     <HudStat label="Meta" value={cash(c.goal, 0)} />
                                     <HudStat label="Gasolina" value={cash(c.gas, 0)} tone="text-rose-400" />
                                     <HudStat label="Neto real" value={cash(c.trueNet, 0)}
-                                             tone={c.trueNet >= 0 ? 'text-emerald-400' : 'text-rose-400'} />
+                                             tone={c.trueNet >= 0 ? 'text-emerald-400' : 'text-rose-300'} />
                                 </div>
 
                                 <div className="grid grid-cols-2 gap-2 mt-3 mb-2">
@@ -2373,10 +2978,127 @@
 
         const HudStat = ({ label, value, tone = 'text-slate-100' }) => (
             <div className="rounded-xl bg-slate-900 border border-slate-800 px-2 py-2.5 text-center">
-                <p className="text-[9px] uppercase tracking-wider text-slate-500 font-bold">{label}</p>
+                <p className="text-[9px] uppercase tracking-wider text-slate-300 font-bold">{label}</p>
                 <p className={`text-base font-bold num ${tone}`}>{value}</p>
             </div>
         );
+
+        /* ============================================================================
+           15f. DOCK ERGONÓMICO DE UNA MANO (THUMB ZONE)
+           Todo lo accionable en marcha vive aquí: en los ~280 px inferiores, con
+           objetivos de 56 px o más y separación generosa (ley de Fitts).
+           ============================================================================ */
+        const DIAL_AMOUNTS = [50, 100, 200, 500];
+
+        function ThumbDock({
+            dockRef, day, filter, counts, onFilter, onInject, onRest, undoState, onUndo, onOpenHud, disabled
+        }) {
+            const { cash } = useCash();
+            const [dialOpen, setDialOpen] = useState(false);
+
+            const goal = day ? num(day.goal) : 0;
+            const earned = day ? num(day.earned) : 0;
+            const missing = Math.max(goal - earned, 0);
+
+            return (
+                <div ref={dockRef}
+                     className="fixed left-0 right-0 bottom-0 z-40 bg-slate-950/95 backdrop-blur border-t border-slate-800"
+                     style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}>
+
+                    {/* Dial de inyección rápida */}
+                    {dialOpen && (
+                        <div className="px-3 pt-3 fade-in">
+                            {disabled ? (
+                                <p className="text-[12px] text-slate-300 text-center pb-2">
+                                    Vuelve al mes en curso para registrar viajes con el dial.
+                                </p>
+                            ) : (
+                                <>
+                                    <div className="flex items-center justify-between gap-2 mb-2">
+                                        <span className="text-[11px] font-bold text-slate-200 num truncate">
+                                            {day.dateString} · {cash(earned, 0)}
+                                        </span>
+                                        <span className="text-[11px] font-bold text-sky-300 num shrink-0">
+                                            {goal <= 0 ? 'día libre'
+                                                : missing > 0 ? `faltan ${cash(missing, 0)}` : 'meta liberada'}
+                                        </span>
+                                    </div>
+                                    <div className="grid grid-cols-4 gap-2.5">
+                                        {DIAL_AMOUNTS.map(amount => (
+                                            <button key={amount} onClick={() => onInject(day.id, amount)}
+                                                    style={{ minHeight: '64px' }}
+                                                    className="focus-ring press rounded-full bg-emerald-600/15 border-2 border-emerald-600/50 text-emerald-300 text-[17px] font-extrabold num transition-colors active:bg-emerald-600/30">
+                                                +{amount}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2.5 mt-2.5">
+                                        <button onClick={() => onRest(day.id)}
+                                                style={{ minHeight: '56px' }}
+                                                className="focus-ring press rounded-2xl bg-slate-800 border border-slate-700 text-slate-100 text-[13px] font-bold transition-colors flex items-center justify-center gap-2">
+                                            <IconClock size={18} /> Día de descanso
+                                        </button>
+                                        <button onClick={onOpenHud}
+                                                style={{ minHeight: '56px' }}
+                                                className="focus-ring press rounded-2xl bg-emerald-600/15 border border-emerald-600/40 text-emerald-300 text-[13px] font-bold transition-colors flex items-center justify-center gap-2">
+                                            <IconGauge size={18} /> Abrir HUD
+                                        </button>
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Deshacer: ventana de 5 segundos */}
+                    {undoState && (
+                        <div className="px-3 pt-2 fade-in">
+                            <button onClick={onUndo} style={{ minHeight: '54px' }}
+                                    className="focus-ring press w-full flex items-center justify-between gap-3 rounded-2xl bg-amber-500/15 border border-amber-500/50 px-4 transition-colors">
+                                <span className="text-[12px] font-bold text-amber-200 truncate">{undoState.label}</span>
+                                <span className="flex items-center gap-1.5 text-amber-300 text-[13px] font-extrabold shrink-0">
+                                    <IconHistory size={18} /> Deshacer
+                                </span>
+                            </button>
+                        </div>
+                    )}
+
+                    {/* Filtros + botón principal, dentro del alcance del pulgar */}
+                    <div className="px-3 py-2.5 flex items-center gap-2.5">
+                        <div className="grid grid-cols-4 gap-1.5 flex-1 min-w-0">
+                            <DockChip active={filter === 'todos'} onClick={() => onFilter('todos')} label="Todos" count={counts.todos} accent="slate" />
+                            <DockChip active={filter === 'cumplidos'} onClick={() => onFilter('cumplidos')} label="Cumpl." count={counts.cumplidos} accent="emerald" />
+                            <DockChip active={filter === 'pendientes'} onClick={() => onFilter('pendientes')} label="Progr." count={counts.pendientes} accent="amber" />
+                            <DockChip active={filter === 'sin'} onClick={() => onFilter('sin')} label="Libres" count={counts.sin} accent="slate" />
+                        </div>
+                        <button onClick={() => { setDialOpen(o => !o); feedback.tap(); }}
+                                aria-expanded={dialOpen} aria-label="Dial de registro rápido"
+                                style={{ minWidth: '56px', minHeight: '56px' }}
+                                className={`focus-ring press rounded-2xl border-2 flex items-center justify-center transition-colors shrink-0 ${
+                                    dialOpen ? 'bg-emerald-600 border-emerald-500 text-white'
+                                             : 'bg-emerald-600/15 border-emerald-600/50 text-emerald-300'}`}>
+                            {dialOpen ? <IconClose size={24} /> : <IconPlus size={24} />}
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
+        const DockChip = ({ active, onClick, label, count, accent }) => {
+            const activeClass = accent === 'emerald'
+                ? 'bg-emerald-500/20 text-emerald-200 border-emerald-500/60'
+                : accent === 'amber'
+                ? 'bg-amber-500/20 text-amber-200 border-amber-500/60'
+                : 'bg-slate-700 text-white border-slate-500';
+            return (
+                <button onClick={onClick} aria-pressed={active} title={`${label}: ${count} días`}
+                        style={{ minHeight: '56px' }}
+                        className={`focus-ring press min-w-0 flex flex-col items-center justify-center rounded-2xl border transition-colors ${
+                            active ? activeClass : 'bg-slate-900 text-slate-300 border-slate-700'}`}>
+                    <span className="num text-[15px] font-extrabold leading-none">{count}</span>
+                    <span className="text-[9px] font-bold uppercase tracking-wider leading-none mt-1 truncate max-w-full">{label}</span>
+                </button>
+            );
+        };
 
         /* ============================================================================
            16. APLICACIÓN
@@ -2408,13 +3130,24 @@
             const [scrollTarget, setScrollTarget] = useState(null);
             const [headerHeight, setHeaderHeight] = useState(92);
 
+            const [undoState, setUndoState] = useState(null);
+            const [dockHeight, setDockHeight] = useState(96);
+
             const dayRefs = useRef({});
             const toastTimer = useRef(null);
             const headerRef = useRef(null);
+            const dockRef = useRef(null);
+            const listRef = useRef(month.list);   // month ya existe; list se desestructura abajo
+            const undoTimer = useRef(null);
+            const undoSnapshot = useRef(null);
+            const goalReached = useRef(false);
 
             const { year, monthIndex, list } = month;
             const costs = meta.costs;
             const stealth = meta.stealth;
+
+            useEffect(() => { listRef.current = list; }, [list]);
+            useEffect(() => { audio.enabled = meta.sound !== false; }, [meta.sound]);
 
             /* ---------- Persistencia ---------- */
             useEffect(() => {
@@ -2436,17 +3169,22 @@
             }, []);
             useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current); }, []);
 
-            /* ---------- Cabecera medida para anclar la barra de filtros ---------- */
+            /* ---------- Cabecera y dock medidos para reservar su espacio ---------- */
             useEffect(() => {
-                const measure = () => { if (headerRef.current) setHeaderHeight(headerRef.current.offsetHeight); };
+                const measure = () => {
+                    if (headerRef.current) setHeaderHeight(headerRef.current.offsetHeight);
+                    if (dockRef.current) setDockHeight(dockRef.current.offsetHeight);
+                };
                 measure();
+                const raf = requestAnimationFrame(measure);
                 window.addEventListener('resize', measure);
                 window.addEventListener('orientationchange', measure);
                 return () => {
+                    cancelAnimationFrame(raf);
                     window.removeEventListener('resize', measure);
                     window.removeEventListener('orientationchange', measure);
                 };
-            }, []);
+            });
 
             /* ---------- Día de hoy dentro del mes visible ---------- */
             const today = useMemo(() => {
@@ -2471,6 +3209,19 @@
             const metrics = useFinancialTelemetry(list, costs, elapsedDays);
             const deferredList = useDeferredValue(list);
             const deferredMetrics = useFinancialTelemetry(deferredList, costs, elapsedDays);
+            const prediction = usePredictiveModels(deferredList, deferredMetrics, costs, elapsedDays);
+
+            /* Muestra de jornadas para la campana de densidad */
+            const grossSamples = useMemo(
+                () => deferredMetrics.computed.filter(c => c.earned > 0).map(c => c.earned),
+                [deferredMetrics]);
+
+            /* Meta diaria media de los días programados */
+            const targetDaily = useMemo(() => {
+                const scheduled = deferredList.filter(d => num(d.goal) > 0);
+                if (scheduled.length === 0) return 0;
+                return scheduled.reduce((acc, d) => acc + num(d.goal), 0) / scheduled.length;
+            }, [deferredList]);
 
             const outliers = useMemo(() => {
                 const { spc, computed } = deferredMetrics;
@@ -2502,6 +3253,30 @@
                 return list.filter(day => getDayStatus(day) === wanted);
             }, [list, filter]);
 
+            /* ---------- Buffer de deshacer: 5 s para revertir un toque en falso ---------- */
+            const pushUndo = useCallback((label) => {
+                undoSnapshot.current = listRef.current;
+                setUndoState({ label });
+                if (undoTimer.current) clearTimeout(undoTimer.current);
+                undoTimer.current = setTimeout(() => {
+                    setUndoState(null);
+                    undoSnapshot.current = null;
+                }, 5000);
+            }, []);
+
+            const undoLast = useCallback(() => {
+                if (!undoSnapshot.current) return;
+                const snapshot = undoSnapshot.current;
+                setMonth(prev => ({ ...prev, list: snapshot }));
+                undoSnapshot.current = null;
+                setUndoState(null);
+                if (undoTimer.current) clearTimeout(undoTimer.current);
+                feedback.warn();
+                notify('Cambio revertido');
+            }, [notify]);
+
+            useEffect(() => () => { if (undoTimer.current) clearTimeout(undoTimer.current); }, []);
+
             /* ---------- Edición ---------- */
             const handleField = useCallback((id, field, value) => {
                 setMonth(prev => ({
@@ -2512,6 +3287,8 @@
             }, []);
 
             const handleQuickAdd = useCallback((id, amount) => {
+                pushUndo(`Viaje de $${money(amount, 0)} registrado`);
+                feedback.confirm();
                 setMonth(prev => ({
                     ...prev,
                     list: prev.list.map(day => {
@@ -2520,11 +3297,11 @@
                         return { ...day, earned: String(Math.round(next * 100) / 100) };
                     })
                 }));
-                haptic(20);
-            }, []);
+            }, [pushUndo]);
 
             /* Swipe →: la jornada cierra justo en su meta */
             const handleAutoGoal = useCallback((id) => {
+                pushUndo('Jornada completada a su meta');
                 setMonth(prev => ({
                     ...prev,
                     list: prev.list.map(day => {
@@ -2533,21 +3310,22 @@
                         return { ...day, earned: goal > 0 ? String(goal) : day.earned };
                     })
                 }));
-                haptic(22);
+                feedback.milestone();
                 notify('Jornada completada al 100% de su meta');
-            }, [notify]);
+            }, [notify, pushUndo]);
 
             /* Swipe ←: jornada de descanso, sin meta ni ingreso */
             const handleRestDay = useCallback((id) => {
+                pushUndo('Día marcado como descanso');
                 setMonth(prev => ({
                     ...prev,
                     list: prev.list.map(day => (day.id === id
                         ? { ...day, goal: 0, earned: '', gas: '', hours: '', km: '', tolls: '', wash: '', misc: '' }
                         : day))
                 }));
-                haptic(22);
-                notify('Día marcado como descanso');
-            }, [notify]);
+                feedback.confirm();
+                notify('Día libre: no cuenta como jornada trabajada');
+            }, [notify, pushUndo]);
 
             const handleCostChange = useCallback((field, value) => {
                 setMeta(prev => ({ ...prev, costs: { ...prev.costs, [field]: value === '' ? 0 : num(value) } }));
@@ -2557,6 +3335,13 @@
                 setMeta(prev => ({ ...prev, stealth: !prev.stealth }));
                 haptic(18);
             }, []);
+
+            /* Hito: la meta del mes se cubre por primera vez */
+            useEffect(() => {
+                const reached = metrics.totalGoal > 0 && metrics.totalEarned >= metrics.totalGoal;
+                if (reached && !goalReached.current) feedback.milestone();
+                goalReached.current = reached;
+            }, [metrics.totalEarned, metrics.totalGoal]);
 
             /* ---------- Navegación ---------- */
             const goToMonth = useCallback((nextYear, nextMonthIndex) => {
@@ -2906,17 +3691,18 @@
                         )}
                     </header>
 
-                    <main className="max-w-2xl mx-auto px-3 pb-16 pt-3 space-y-3">
+                    <main className="max-w-2xl mx-auto px-3 pt-3 space-y-3"
+                          style={{ paddingBottom: `${dockHeight + 24}px` }}>
 
                         {/* ---------- Utilidad neta real ---------- */}
                         <section className="bg-slate-900 rounded-2xl border border-slate-800 p-4">
                             <div className="flex items-start justify-between gap-3">
                                 <div className="min-w-0">
-                                    <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500 font-bold mb-1">
+                                    <p className="text-[10px] uppercase tracking-[0.14em] text-slate-300 font-bold mb-1">
                                         Utilidad neta real
                                     </p>
                                     <p className={`text-3xl font-bold num tracking-tight ${
-                                        metrics.netProfit >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                        metrics.netProfit >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>
                                         <AnimatedCash value={metrics.netProfit} />
                                     </p>
                                     <p className="text-[11px] text-slate-500 num mt-1">
@@ -2989,7 +3775,7 @@
                             metrics.goalGap > 0 ? 'bg-slate-900 border-slate-800' : 'bg-emerald-950/25 border-emerald-800/50'}`}>
                             <div className="flex items-center justify-between gap-3">
                                 <div className="min-w-0">
-                                    <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500 font-bold">
+                                    <p className="text-[10px] uppercase tracking-[0.14em] text-slate-300 font-bold">
                                         {metrics.goalGap > 0 ? 'Cuota diaria requerida' : 'Meta mensual superada'}
                                     </p>
                                     <p className={`text-2xl font-bold num mt-1 ${
@@ -3055,12 +3841,16 @@
                                         sub={metrics.totalKm > 0 ? `${money(metrics.totalKm, 0)} km recorridos` : 'Captura km en el detalle'} />
                         </section>
 
+                        <PredictivePanel prediction={prediction} metrics={deferredMetrics}
+                                         samples={grossSamples} targetDaily={targetDaily} />
+
                         <SinkingFundsPanel funds={metrics.funds} netProfit={metrics.netProfit}
                                            grossIncome={metrics.totalEarned} />
 
                         <WhatIfPanel metrics={deferredMetrics} />
 
-                        <CumulativeChart days={deferredList} metrics={deferredMetrics} todayIndex={today.index} />
+                        <CumulativeChart days={deferredList} metrics={deferredMetrics}
+                                         todayIndex={today.index} prediction={prediction} />
 
                         <ProductivityHeatmap days={deferredList} computed={deferredMetrics.computed}
                                              year={year} monthIndex={monthIndex}
@@ -3071,16 +3861,13 @@
 
                         <SpcPanel spc={deferredMetrics.spc} outliers={outliers} onPickDay={focusDay} />
 
-                        {/* ---------- Filtros ---------- */}
-                        <nav className="sticky z-20 -mx-3 px-3 py-2 bg-slate-950/95 backdrop-blur border-b border-slate-800"
-                             style={{ top: headerHeight + 'px' }} aria-label="Filtros de días">
-                            <div className="grid grid-cols-4 gap-1.5">
-                                <FilterChip active={filter === 'todos'} onClick={() => setFilter('todos')} label="Todos" count={counts.todos} accent="slate" />
-                                <FilterChip active={filter === 'cumplidos'} onClick={() => setFilter('cumplidos')} label="Cumplidos" count={counts.cumplidos} accent="emerald" />
-                                <FilterChip active={filter === 'pendientes'} onClick={() => setFilter('pendientes')} label="Progreso" count={counts.pendientes} accent="amber" />
-                                <FilterChip active={filter === 'sin'} onClick={() => setFilter('sin')} label="Sin registro" count={counts.sin} accent="slate" />
-                            </div>
-                        </nav>
+                        <div className="flex items-center justify-between gap-2 pt-1">
+                            <h2 className="text-slate-100 text-sm font-semibold tracking-tight">Jornadas</h2>
+                            <span className="text-[11px] text-slate-400 num">
+                                {visibleDays.length} de {counts.todos} días
+                                {filter !== 'todos' ? ' · filtrado' : ''}
+                            </span>
+                        </div>
 
                         {/* ---------- Jornadas ---------- */}
                         <section className="space-y-2.5">
@@ -3124,7 +3911,27 @@
                         onImportFile={importFile}
                         onExportCsv={exportCsv}
                         onCopySummary={copySummary}
-                        onClearMonth={clearMonth} />
+                        onClearMonth={clearMonth}
+                        soundOn={meta.sound !== false}
+                        onToggleSound={() => {
+                            const next = meta.sound === false;
+                            setMeta(prev => ({ ...prev, sound: next }));
+                            audio.enabled = next;
+                            if (next) feedback.confirm();
+                        }} />
+
+                    <ThumbDock
+                        dockRef={dockRef}
+                        day={todayDay}
+                        disabled={!todayDay}
+                        filter={filter}
+                        counts={counts}
+                        onFilter={(value) => { setFilter(value); feedback.tap(); }}
+                        onInject={handleQuickAdd}
+                        onRest={handleRestDay}
+                        undoState={undoState}
+                        onUndo={undoLast}
+                        onOpenHud={() => { setHudOpen(true); feedback.tap(); }} />
 
                     <ShiftHud
                         open={hudOpen}
@@ -3145,7 +3952,7 @@
 
                     {toast && (
                         <div className="fixed left-0 right-0 z-[60] flex justify-center px-4 pointer-events-none"
-                             style={{ bottom: 'calc(1rem + env(safe-area-inset-bottom, 0px))' }}
+                             style={{ bottom: `calc(${dockHeight + 12}px + env(safe-area-inset-bottom, 0px))` }}
                              role="status" aria-live="polite">
                             <div className={`sheet-in flex items-center gap-2 rounded-xl border px-3.5 py-2.5 text-[12px] font-semibold shadow-lg ${
                                 toast.tone === 'warn'
@@ -3163,9 +3970,9 @@
 
         const CostChip = ({ label, value, color, pct }) => (
             <div className="bg-slate-800/40 border border-slate-800 rounded-lg px-2 py-1.5">
-                <p className="text-[9px] uppercase tracking-wider text-slate-500 font-bold truncate">{label}</p>
+                <p className="text-[9px] uppercase tracking-wider text-slate-300 font-bold truncate">{label}</p>
                 <p className={`text-[13px] font-bold num ${color}`}>{value}</p>
-                <p className="text-[9px] text-slate-600 num">{pctText(pct, 1)} del bruto</p>
+                <p className="text-[9px] text-slate-400 num">{pctText(pct, 1)} del bruto</p>
             </div>
         );
 
