@@ -48,6 +48,25 @@ neumáticos y $0.35 de depreciación y seguro prorrateado, $0.80/km en total).
 Si el gasto de gasolina por kilómetro de un día supera en 25% el promedio del mes, la tarjeta
 levanta un aviso de consumo alto (tráfico pesado o ineficiencia).
 
+## Punto de equilibrio y finanzas defensivas
+
+**Break-even diario dinámico:** el umbral en bruto que la jornada necesita solo para pagarse
+(`gasolina + km × costo por km + casetas + lavado + varios`). Cada tarjeta y el resumen mensual
+declaran el estado: *en zona de déficit* (con el faltante para llegar a tablas), *punto de equilibrio
+alcanzado* o *utilidad neta positiva* (con lo que queda limpio).
+
+**Sobres virtuales:** provisiones calculadas sobre el bruto acumulado, configurables en el menú.
+
+| Sobre | Por defecto | Para qué |
+| --- | --- | --- |
+| Mantenimiento y amortización | 8% | Llantas, frenos, servicio, póliza |
+| Resguardo fiscal y plataforma | 2.5% | Colchón de retenciones e impuestos |
+| Flujo libre de bolsillo | — | `neto real − provisiones` |
+
+**Simulador de sensibilidad:** dos sliders (precio del combustible de −15% a +25%, jornadas
+adicionales de +1 a +5) que recalculan en vivo el neto simulado, el neto por jornada extra,
+el sobrecosto de combustible en esas jornadas y el impacto si el alza dura todo el mes.
+
 ## Control estadístico (SPC)
 
 Sobre la utilidad neta de las jornadas trabajadas: media (μ), desviación estándar (σ),
@@ -58,14 +77,23 @@ navegables desde el panel.
 
 ## Visualización (SVG puro, sin librerías)
 
-- **Curva de acumulación** con meta acumulada, real acumulado, proyección punteada y
-  **inspector táctil**: arrastra el dedo para ver fecha, meta acumulada, real acumulado y neto del día.
+- **Tacómetro radial** de 240° con graduación, arco animado por `stroke-dashoffset` y gradiente
+  ámbar→esmeralda: mide la *eficiencia de pacing*, el avance de la meta contra el avance del calendario.
+- **Curva de acumulación** con interpolación Bézier cúbica (Catmull-Rom con los controles acotados
+  al tramo, así una serie acumulada nunca oscila), meta acumulada, real acumulado, proyección punteada
+  e **inspector táctil**: arrastra el dedo para ver fecha, meta acumulada, real acumulado y neto del día.
 - **Matriz de productividad** tipo calendario: cada celda colorea el cumplimiento del día
   y al tocarla salta a su tarjeta.
 - **Rentabilidad por día de la semana**: promedio de utilidad neta de lunes a domingo.
 
 ## Ergonomía en cabina
 
+- **HUD de cabina:** vista a pantalla completa para el soporte del vehículo, con tipografía
+  monumental, anillo de progreso hacia la meta del día, cuánto falta, a cuántos viajes equivale
+  y botones de inyección rápida de `+$50`, `+$100`, `+$150` y `+$200`.
+- **Gestos de deslizamiento:** arrastra una tarjeta a la derecha para cerrar el día justo en su
+  meta, o a la izquierda para marcarlo como jornada de descanso. El umbral son 74 px, con
+  resistencia elástica más allá y vibración al armarse; soltar antes del umbral cancela.
 - **Modo sigilo:** el botón del ojo enmascara todos los montos (`$ ••••` y desenfoque) y deja
   visibles los porcentajes, para consultar el tablero con pasajeros a bordo.
 - **Turno en caliente:** cuánto falta para la meta del día, a cuántos viajes equivale según el
@@ -82,12 +110,22 @@ navegables desde el panel.
 - Copiar resumen ejecutivo al portapapeles, listo para WhatsApp.
 - Limpieza del mes visible con confirmación de dos pasos (los demás meses no se tocan).
 
+## Motion
+
+Sin librerías de animación: todo es `transform`/`opacity` acelerado por GPU, `requestAnimationFrame`
+y SVG. El hook `useAnimatedNumber` interpola las cifras grandes como un odómetro, aislado en el
+componente `AnimatedCash` para que la animación no repinte el resto del tablero. Las tarjetas que
+cruzan el 100% reciben un destello y un glow esmeralda pulsante. Todo respeta
+`prefers-reduced-motion`.
+
 ## Stack
 
 React 18, ReactDOM 18 y Babel Standalone desde cdnjs, más Tailwind CSS por CDN.
-Cero librerías de gráficos o iconos: todo es SVG inline. Los cálculos pesados van en `useMemo`,
-los handlers en `useCallback` y las tarjetas están memoizadas con estadísticas diferidas
-(`useDeferredValue`) para que escribir no dispare el recálculo de las 31 tarjetas.
+Cero librerías de gráficos, iconos o animación: todo es SVG inline y CSS.
+La matemática vive en hooks desacoplados del render (`useFinancialTelemetry`, `useBreakEven`,
+`useAnimatedNumber`); los cálculos pesados van en `useMemo`, los handlers en `useCallback` y las
+tarjetas están memoizadas con estadísticas diferidas (`useDeferredValue`) para que escribir no
+dispare el recálculo de las 31 tarjetas.
 
 Nota: al abrir Septiembre 2026 sin datos previos, el día 1 conserva la semilla histórica
 de $189.61 que traía el archivo original.
