@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#020617">
+    <meta name="description" content="Dashboard de telemetría financiera y rendimiento operativo para conductor DiDi.">
+    <title>Telemetría DiDi</title>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
+
+    <style>
+        html, body { background-color: #020617; }
+        body {
+            padding-top: env(safe-area-inset-top, 0px);
+            padding-bottom: env(safe-area-inset-bottom, 0px);
+            -webkit-font-smoothing: antialiased;
+        }
+        .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+        input[type="text"] { -webkit-appearance: none; appearance: none; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 9999px; }
+        @media (prefers-reduced-motion: reduce) {
+            * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+        }
+        .sheet-in { animation: sheetIn .22s ease-out; }
+        @keyframes sheetIn { from { transform: translateY(16px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+        .focus-ring:focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
+    </style>
+</head>
+<body class="bg-slate-950">
+    <div id="root"></div>
+
+    <script type="text/babel" data-presets="react">
+        const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+        /* ============================================================
+           CONSTANTES DE DOMINIO
+           ============================================================ */
+        const STORAGE_KEY = 'didi-tracker-app';
+        const MONTH_INDEX = 8;          // Septiembre (0-based)
+        const MONTH_YEAR = 2026;
+        const MONTH_LABEL = 'Sept';
+        const MONTH_LONG = 'Septiembre 2026';
+        const TOTAL_DAYS = 30;
+
+        const DAYS_OF_WEEK = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+
+        const getDefaultGoal = (dayName) => {
+            switch (dayName) {
+                case 'Lunes': case 'Miércoles': case 'Jueves': return 400;
+                case 'Martes': case 'Viernes': return 150;
+                case 'Sábado': case 'Domingo': return 1000;
+                default: return 0;
+            }
+        };
+
+        /* Plantilla base del mes: misma estructura de datos del archivo original. */
+        const buildBaseMonth = () => Array.from({ length: TOTAL_DAYS }, (_, i) => {
+            const date = new Date(MONTH_YEAR, MONTH_INDEX, i + 1);
+            const dayName = DAYS_OF_WEEK[date.getDay()];
+            return {
+                id: i + 1,
+                dateString: `${i + 1} ${MONTH_LABEL}`,
+                dayName: dayName,
+                goal: getDefaultGoal(dayName),
+                earned: i === 0 ? 189.61 : '',
+                gas: ''
+            };
+        });
+
+        /* ============================================================
+           UTILIDADES NUMÉRICAS Y DE FORMATO
+           ============================================================ */
+        const num = (value) => {
+            if (value === '' || value === null || value === undefined) return 0;
+            const parsed = parseFloat(value);
+            return Number.isFinite(parsed) ? parsed : 0;
+        };
+
+        /* Sanea la entrada del teclado: solo dígitos y un punto decimal.
+           Evita NaN, notación científica, signos y pegados corruptos. */
+        const sanitizeMoney = (raw) => {
+            let value = String(raw == null ? '' : raw).replace(/,/g, '.').replace(/[^0-9.]/g, '');
+            const parts = value.split('.');
+            if (parts.length > 2) value = parts[0] + '.' + parts.slice(1).join('');
+            const [intPart, decPart] = value.split('.');
+            const safeInt = (intPart || '').slice(0, 7);
+            if (decPart === undefined) return safeInt;
+            return safeInt + '.' + decPart.slice(0, 2);
+        };
+
+        const money = (value, decimals = 2) => num(value).toLocaleString('es-MX', {
+            minimumFractionDigits: decimals,
+            maximumFractionDigits: decimals
+        });
+
+        const moneyShort = (value) => {
+            const n = num(value);
+            const abs = Math.abs(n);
+            if (abs >= 1000) return (n / 1000).toLocaleString('es-MX', { maximumFractionDigits: 1 }) + 'k';
+            return n.toLocaleString('es-MX', { maximumFractionDigits: 0 });
+        };
+
+        const pct = (value, decimals = 1) => {
+            const n = Number.isFinite(value) ? value : 0;
+            return n.toFixed(decimals) + '%';
+        };
+
+        const getPercentage = (earned, goal) => {
+            const e = num(earned);
+            const g = num(goal);
+            if (g <= 0) return e > 0 ? 100 : 0;
+            return Math.min((e / g) * 100, 1000);
+        };
+
+        const getDayStatus = (day) => {
+            const earned = num(day.earned);
+            if (earned <= 0) return 'sin';
+            const goal = num(day.goal);
+            if (goal <= 0 || earned >= goal) return 'cumplido';
+            return 'pendiente';
+        };
+
+        /* ============================================================
+           MIGRACIÓN NO DESTRUCTIVA
+           Conserva íntegro lo que el usuario ya tenía guardado y solo
+           completa los campos faltantes contra la plantilla base.
+           ============================================================ */
+        const loadDays = () => {
+            const base = buildBaseMonth();
+            let stored = null;
+            try {
+                const raw = localStorage.getItem(STORAGE_KEY);
+                if (raw) stored = JSON.parse(raw);
+            } catch (err) {
+                stored = null;
+            }
+            if (!Array.isArray(stored) || stored.length === 0) return base;
+            return mergeWithBase(stored, base);
+        };
+
+        const mergeWithBase = (stored, base) => {
+            const byId = new Map();
+            base.forEach(day => byId.set(day.id, day));
+
+            stored.forEach((entry, index) => {
+                if (!entry || typeof entry !== 'object') return;
+                const id = Number.isFinite(Number(entry.id)) ? Number(entry.id) : index + 1;
+                const template = byId.get(id) || {
+                    id: id,
+                    dateString: `${id} ${MONTH_LABEL}`,
+                    dayName: DAYS_OF_WEEK[new Date(MONTH_YEAR, MONTH_INDEX, id).getDay()],
+                    goal: 0,
+                    earned: '',
+                    gas: ''
+                };
+                byId.set(id, {
+                    ...template,
+                    ...entry,
+                    id: id,
+                    dateString: entry.dateString || template.dateString,
+                    dayName: entry.dayName || template.dayName,
+                    goal: entry.goal === undefined || entry.goal === null ? template.goal : entry.goal,
+                    earned: entry.earned === undefined || entry.earned === null ? '' : entry.earned,
+                    gas: entry.gas === undefined || entry.gas === null ? '' : entry.gas
+                });
+            });
+
+            return Array.from(byId.values()).sort((a, b) => a.id - b.id);
+        };
+
+        /* ============================================================
+           ICONOS SVG INLINE (sin dependencias externas)
+           ============================================================ */
+        const Icon = ({ path, size = 18, className = '', strokeWidth = 1.8 }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24"
+                 fill="none" stroke="currentColor" strokeWidth={strokeWidth}
+                 strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+                {path}
+            </svg>
+        );
+
+        const IconSliders = (p) => <Icon {...p} path={<><line x1="4" y1="21" x2="4" y2="14" /><line x1="4" y1="10" x2="4" y2="3" /><line x1="12" y1="21" x2="12" y2="12" /><line x1="12" y1="8" x2="12" y2="3" /><line x1="20" y1="21" x2="20" y2="16" /><line x1="20" y1="12" x2="20" y2="3" /><line x1="1" y1="14" x2="7" y2="14" /><line x1="9" y1="8" x2="15" y2="8" /><line x1="17" y1="16" x2="23" y2="16" /></>} />;
+        const IconCrosshair = (p) => <Icon {...p} path={<><circle cx="12" cy="12" r="8" /><line x1="12" y1="1" x2="12" y2="4" /><line x1="12" y1="20" x2="12" y2="23" /><line x1="1" y1="12" x2="4" y2="12" /><line x1="20" y1="12" x2="23" y2="12" /><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none" /></>} />;
+        const IconDownload = (p) => <Icon {...p} path={<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></>} />;
+        const IconUpload = (p) => <Icon {...p} path={<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></>} />;
+        const IconGrid = (p) => <Icon {...p} path={<><rect x="3" y="3" width="18" height="18" rx="2" /><line x1="3" y1="9" x2="21" y2="9" /><line x1="3" y1="15" x2="21" y2="15" /><line x1="9" y1="3" x2="9" y2="21" /></>} />;
+        const IconTrash = (p) => <Icon {...p} path={<><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /></>} />;
+        const IconClose = (p) => <Icon {...p} path={<><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></>} />;
+        const IconTrend = (p) => <Icon {...p} path={<><polyline points="23 6 13.5 15.5 8.5 10.5 1 18" /><polyline points="17 6 23 6 23 12" /></>} />;
+        const IconFuel = (p) => <Icon {...p} path={<><line x1="3" y1="22" x2="15" y2="22" /><line x1="4" y1="9" x2="14" y2="9" /><path d="M14 22V4a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v18" /><path d="M14 13h2a2 2 0 0 1 2 2v2a2 2 0 0 0 2 2a2 2 0 0 0 2-2V9.83a2 2 0 0 0-.59-1.42L18 5" /></>} />;
+        const IconTarget = (p) => <Icon {...p} path={<><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="5" /><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" /></>} />;
+        const IconWallet = (p) => <Icon {...p} path={<><path d="M20 12V8H6a2 2 0 0 1 0-4h12v4" /><path d="M4 6v12a2 2 0 0 0 2 2h14v-4" /><path d="M18 12a2 2 0 0 0 0 4h4v-4z" /></>} />;
+        const IconGauge = (p) => <Icon {...p} path={<><path d="M12 15l4-4" /><path d="M3.5 17a9 9 0 1 1 17 0" /><circle cx="12" cy="17" r="1.5" fill="currentColor" stroke="none" /></>} />;
+        const IconCheck = (p) => <Icon {...p} path={<polyline points="4 12 9 17 20 6" />} />;
+        const IconAlert = (p) => <Icon {...p} path={<><path d="M12 3l9 16H3l9-16z" /><line x1="12" y1="9" x2="12" y2="13" /><circle cx="12" cy="16.5" r="1" fill="currentColor" stroke="none" /></>} />;
+        const IconCalendar = (p) => <Icon {...p} path={<><rect x="3" y="5" width="18" height="16" rx="2" /><line x1="3" y1="10" x2="21" y2="10" /><line x1="8" y1="3" x2="8" y2="7" /><line x1="16" y1="3" x2="16" y2="7" /></>} />;
+
+        /* ============================================================
+           SPARKLINE SVG NATIVO — Acumulados Meta vs Real
+           ============================================================ */
+        function CumulativeSparkline({ days, todayIndex, projectedGross }) {
+            const W = 340, H = 150;
+            const padL = 8, padR = 10, padT = 14, padB = 22;
+
+            const series = useMemo(() => {
+                let accGoal = 0, accReal = 0;
+                const goalPts = [];
+                const realPts = [];
+                let lastWithData = -1;
+                days.forEach((day, i) => {
+                    accGoal += num(day.goal);
+                    accReal += num(day.earned);
+                    goalPts.push(accGoal);
+                    realPts.push(accReal);
+                    if (num(day.earned) > 0) lastWithData = i;
+                });
+                return { goalPts, realPts, lastWithData, totalGoal: accGoal, totalReal: accReal };
+            }, [days]);
+
+            const count = days.length || 1;
+            const realEnd = Math.max(series.lastWithData, Math.min(todayIndex, count - 1), 0);
+            const maxY = Math.max(series.totalGoal, series.totalReal, num(projectedGross), 1);
+
+            const x = (i) => padL + (i / Math.max(count - 1, 1)) * (W - padL - padR);
+            const y = (v) => H - padB - (v / maxY) * (H - padT - padB);
+
+            const toPath = (values, endIndex) => values
+                .slice(0, endIndex + 1)
+                .map((v, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(v).toFixed(1)}`)
+                .join(' ');
+
+            const goalPath = toPath(series.goalPts, count - 1);
+            const realPath = toPath(series.realPts, realEnd);
+            const areaPath = `${realPath} L${x(realEnd).toFixed(1)},${y(0).toFixed(1)} L${x(0).toFixed(1)},${y(0).toFixed(1)} Z`;
+
+            const projPath = (num(projectedGross) > 0 && realEnd < count - 1)
+                ? `M${x(realEnd).toFixed(1)},${y(series.realPts[realEnd]).toFixed(1)} L${x(count - 1).toFixed(1)},${y(num(projectedGross)).toFixed(1)}`
+                : null;
+
+            const gridValues = [0.25, 0.5, 0.75, 1].map(f => maxY * f);
+            const ticks = [0, 7, 14, 21, count - 1].filter((v, i, arr) => arr.indexOf(v) === i && v < count);
+
+            return (
+                <div className="bg-slate-900 rounded-2xl border border-slate-700/50 p-4">
+                    <div className="flex items-start justify-between gap-3 mb-1">
+                        <div>
+                            <h2 className="text-slate-100 text-sm font-semibold tracking-tight">Curva de acumulación</h2>
+                            <p className="text-slate-500 text-[11px]">Meta comprometida vs. ingreso real del mes</p>
+                        </div>
+                        <span className="text-[10px] uppercase tracking-widest text-slate-500 font-semibold shrink-0 pt-1">{MONTH_LONG}</span>
+                    </div>
+
+                    <svg viewBox={`0 0 ${W} ${H}`} width="100%" role="img"
+                         preserveAspectRatio="xMidYMid meet"
+                         aria-label={`Acumulado real ${money(series.totalReal)} pesos contra meta acumulada ${money(series.totalGoal)} pesos`}
+                         className="block mt-2 w-full h-auto max-w-full overflow-visible">
+                        <defs>
+                            <linearGradient id="realFill" x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="0%" stopColor="#10b981" stopOpacity="0.35" />
+                                <stop offset="100%" stopColor="#10b981" stopOpacity="0.02" />
+                            </linearGradient>
+                        </defs>
+
+                        {gridValues.map((v, i) => (
+                            <line key={`g${i}`} x1={padL} x2={W - padR} y1={y(v)} y2={y(v)}
+                                  stroke="#1e293b" strokeWidth="1" fill="none" />
+                        ))}
+                        <line x1={padL} x2={W - padR} y1={y(0)} y2={y(0)} stroke="#334155" strokeWidth="1" fill="none" />
+
+                        <path d={areaPath} fill="url(#realFill)" stroke="none" />
+                        <path d={goalPath} fill="none" stroke="#64748b" strokeWidth="2"
+                              strokeDasharray="5 4" strokeLinecap="round" />
+                        {projPath && (
+                            <path d={projPath} fill="none" stroke="#38bdf8" strokeWidth="1.8"
+                                  strokeDasharray="2 5" strokeLinecap="round" opacity="0.9" />
+                        )}
+                        <path d={realPath} fill="none" stroke="#10b981" strokeWidth="2.4"
+                              strokeLinecap="round" strokeLinejoin="round" />
+
+                        <circle cx={x(realEnd)} cy={y(series.realPts[realEnd] || 0)} r="3.6" fill="#10b981" stroke="#022c22" strokeWidth="1.5" />
+                        {projPath && (
+                            <circle cx={x(count - 1)} cy={y(num(projectedGross))} r="3" fill="#0f172a" stroke="#38bdf8" strokeWidth="1.6" />
+                        )}
+
+                        <text x={padL} y={padT - 4} fill="#64748b" fontSize="9" fontFamily="system-ui, sans-serif">
+                            ${moneyShort(maxY)}
+                        </text>
+                        {ticks.map((t) => (
+                            <text key={`t${t}`} x={x(t)} y={H - 6} fill="#64748b" fontSize="9"
+                                  fontFamily="system-ui, sans-serif"
+                                  textAnchor={t === 0 ? 'start' : (t === count - 1 ? 'end' : 'middle')}>
+                                {t + 1}
+                            </text>
+                        ))}
+                    </svg>
+
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-3 pt-3 border-t border-slate-800">
+                        <Legend color="#10b981" label="Real acumulado" value={`$${money(series.totalReal)}`} />
+                        <Legend color="#64748b" dashed label="Meta acumulada" value={`$${money(series.totalGoal)}`} />
+                        {projPath && <Legend color="#38bdf8" dashed label="Proyección" value={`$${money(projectedGross)}`} />}
+                    </div>
+                </div>
+            );
+        }
+
+        const Legend = ({ color, label, value, dashed }) => (
+            <span className="flex items-center gap-1.5 text-[11px]">
+                <span className="inline-block w-4 h-0.5 rounded-full shrink-0"
+                      style={{ backgroundColor: dashed ? 'transparent' : color, backgroundImage: dashed ? `repeating-linear-gradient(90deg, ${color} 0 3px, transparent 3px 6px)` : 'none' }}></span>
+                <span className="text-slate-400">{label}</span>
+                <span className="text-slate-200 font-semibold num">{value}</span>
+            </span>
+        );
+
+        /* ============================================================
+           TARJETAS DE MÉTRICA
+           ============================================================ */
+        const MetricTile = ({ icon, label, value, sub, tone = 'neutral', className = '' }) => {
+            const tones = {
+                neutral: 'text-slate-100',
+                positive: 'text-emerald-400',
+                negative: 'text-rose-400',
+                info: 'text-sky-400',
+                warning: 'text-amber-400'
+            };
+            return (
+                <div className={`bg-slate-900 rounded-xl border border-slate-700/50 px-3 py-2.5 ${className}`}>
+                    <div className="flex items-center gap-1.5 text-slate-500 mb-1">
+                        {icon}
+                        <span className="text-[9px] uppercase tracking-[0.12em] font-bold">{label}</span>
+                    </div>
+                    <p className={`text-lg font-bold num leading-tight ${tones[tone]}`}>{value}</p>
+                    {sub && <p className="text-[10px] text-slate-500 num mt-0.5">{sub}</p>}
+                </div>
+            );
+        };
+
+        const MeterRow = ({ label, value, display, color, track = 'bg-slate-800' }) => (
+            <div className="space-y-1">
+                <div className="flex justify-between items-baseline text-[11px]">
+                    <span className="text-slate-400 font-medium">{label}</span>
+                    <span className="text-slate-200 font-bold num">{display}</span>
+                </div>
+                <div className={`w-full ${track} rounded-full h-1.5 overflow-hidden`}>
+                    <div className={`${color} h-1.5 rounded-full transition-all duration-500`}
+                         style={{ width: `${Math.max(0, Math.min(value, 100))}%` }}></div>
+                </div>
+            </div>
+        );
+
+        /* ============================================================
+           PANEL DE HERRAMIENTAS (respaldo / restauración / limpieza)
+           ============================================================ */
+        function ToolsSheet({ open, onClose, onExportJson, onExportCsv, onImportFile, onClearAll, dayCount, lastSavedAt }) {
+            const [armed, setArmed] = useState(false);
+            const fileRef = useRef(null);
+
+            useEffect(() => { if (!open) setArmed(false); }, [open]);
+
+            useEffect(() => {
+                if (!open) return;
+                const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+                window.addEventListener('keydown', onKey);
+                return () => window.removeEventListener('keydown', onKey);
+            }, [open, onClose]);
+
+            if (!open) return null;
+
+            return (
+                <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center" role="dialog" aria-modal="true" aria-label="Gestión de datos">
+                    <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm" onClick={onClose}></div>
+
+                    <div className="relative w-full sm:max-w-md bg-slate-900 border-t sm:border border-slate-700/60 rounded-t-3xl sm:rounded-2xl p-5 sheet-in max-h-[88vh] overflow-y-auto"
+                         style={{ paddingBottom: 'calc(1.25rem + env(safe-area-inset-bottom, 0px))' }}>
+                        <div className="flex items-start justify-between mb-1">
+                            <div>
+                                <h2 className="text-slate-100 font-bold tracking-tight">Gestión de datos</h2>
+                                <p className="text-[11px] text-slate-500 num">
+                                    {dayCount} días en memoria{lastSavedAt ? ` · guardado ${lastSavedAt}` : ''}
+                                </p>
+                            </div>
+                            <button onClick={onClose} aria-label="Cerrar"
+                                    className="focus-ring text-slate-400 hover:text-slate-100 p-1 -mr-1 rounded-lg">
+                                <IconClose size={20} />
+                            </button>
+                        </div>
+
+                        <div className="space-y-2 mt-4">
+                            <SheetButton onClick={onExportJson} icon={<IconDownload size={18} />}
+                                         title="Exportar respaldo" detail="Archivo .json con fecha y hora" accent="emerald" />
+
+                            <SheetButton onClick={() => fileRef.current && fileRef.current.click()} icon={<IconUpload size={18} />}
+                                         title="Importar respaldo" detail="Restaura un .json exportado" accent="sky" />
+                            <input ref={fileRef} type="file" accept="application/json,.json" className="hidden"
+                                   onChange={(e) => {
+                                       const file = e.target.files && e.target.files[0];
+                                       if (file) onImportFile(file);
+                                       e.target.value = '';
+                                   }} />
+
+                            <SheetButton onClick={onExportCsv} icon={<IconGrid size={18} />}
+                                         title="Exportar a CSV" detail="Hoja de cálculo para Excel" accent="violet" />
+                        </div>
+
+                        <div className="mt-5 pt-4 border-t border-slate-800">
+                            <p className="text-[10px] uppercase tracking-[0.12em] font-bold text-slate-500 mb-2">Zona sensible</p>
+
+                            {!armed ? (
+                                <button onClick={() => setArmed(true)}
+                                        className="focus-ring w-full flex items-center gap-3 text-left bg-slate-800/60 hover:bg-rose-950/40 border border-slate-700/60 hover:border-rose-800/60 rounded-xl px-3 py-3 transition-colors">
+                                    <span className="text-rose-400"><IconTrash size={18} /></span>
+                                    <span className="flex-1">
+                                        <span className="block text-sm font-semibold text-slate-100">Limpiar todos los registros</span>
+                                        <span className="block text-[11px] text-slate-500">Paso 1 de 2 · pedirá confirmación</span>
+                                    </span>
+                                </button>
+                            ) : (
+                                <div className="bg-rose-950/30 border border-rose-900/60 rounded-xl p-3">
+                                    <div className="flex items-start gap-2 mb-3">
+                                        <span className="text-rose-400 mt-0.5 shrink-0"><IconAlert size={18} /></span>
+                                        <p className="text-[12px] text-rose-200 leading-snug">
+                                            Se borrarán ingresos y gasolina de los {dayCount} días y las metas volverán
+                                            a su valor por defecto. Esta acción no se puede deshacer: exporta un respaldo antes.
+                                        </p>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <button onClick={() => setArmed(false)}
+                                                className="focus-ring bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-semibold rounded-lg py-2.5 transition-colors">
+                                            Cancelar
+                                        </button>
+                                        <button onClick={() => { setArmed(false); onClearAll(); }}
+                                                className="focus-ring bg-rose-600 hover:bg-rose-500 text-white text-sm font-bold rounded-lg py-2.5 transition-colors">
+                                            Sí, borrar todo
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        <p className="text-[10px] text-slate-600 mt-4 leading-relaxed">
+                            Los datos viven solo en este navegador (<span className="num">localStorage</span>).
+                            Si cambias de teléfono o limpias el caché, necesitarás el respaldo .json.
+                        </p>
+                    </div>
+                </div>
+            );
+        }
+
+        const SheetButton = ({ onClick, icon, title, detail, accent }) => {
+            const accents = {
+                emerald: 'text-emerald-400',
+                sky: 'text-sky-400',
+                violet: 'text-violet-400'
+            };
+            return (
+                <button onClick={onClick}
+                        className="focus-ring w-full flex items-center gap-3 text-left bg-slate-800/60 hover:bg-slate-800 border border-slate-700/60 rounded-xl px-3 py-3 transition-colors">
+                    <span className={accents[accent]}>{icon}</span>
+                    <span className="flex-1">
+                        <span className="block text-sm font-semibold text-slate-100">{title}</span>
+                        <span className="block text-[11px] text-slate-500">{detail}</span>
+                    </span>
+                </button>
+            );
+        };
+
+        /* ============================================================
+           CAMPO NUMÉRICO CON VALIDACIÓN
+           ============================================================ */
+        const MoneyField = ({ id, label, value, onChange, tone }) => {
+            const tones = {
+                goal: { label: 'text-slate-400', box: 'bg-slate-800/70 border-slate-700 text-slate-200 focus:border-slate-500 focus:ring-slate-600' },
+                earned: { label: 'text-emerald-400', box: 'bg-emerald-950/30 border-emerald-800/60 text-emerald-100 font-bold focus:border-emerald-500 focus:ring-emerald-700' },
+                gas: { label: 'text-rose-400', box: 'bg-rose-950/25 border-rose-900/60 text-rose-100 font-semibold focus:border-rose-500 focus:ring-rose-800' }
+            };
+            const t = tones[tone];
+            return (
+                <div>
+                    <label htmlFor={id} className={`block text-[9px] font-bold uppercase tracking-wider mb-1 ${t.label}`}>{label}</label>
+                    <div className="relative">
+                        <span className="absolute left-2 top-1/2 -translate-y-1/2 text-[11px] text-slate-500 pointer-events-none">$</span>
+                        <input
+                            id={id}
+                            type="text"
+                            inputMode="decimal"
+                            autoComplete="off"
+                            value={value === null || value === undefined ? '' : String(value)}
+                            onChange={(e) => onChange(sanitizeMoney(e.target.value))}
+                            onBlur={(e) => onChange(sanitizeMoney(e.target.value))}
+                            placeholder="0"
+                            className={`num w-full border rounded-lg py-2 pl-5 pr-2 text-sm transition-colors focus:outline-none focus:ring-1 ${t.box}`}
+                        />
+                    </div>
+                </div>
+            );
+        };
+
+        /* ============================================================
+           TARJETA DE DÍA
+           ============================================================ */
+        const DayCard = React.forwardRef(function DayCard({ day, isToday, onGoal, onEarned, onGas }, ref) {
+            const percentage = getPercentage(day.earned, day.goal);
+            const status = getDayStatus(day);
+            const earned = num(day.earned);
+            const gas = num(day.gas);
+            const net = earned - gas;
+            const hasData = earned > 0 || gas > 0;
+
+            const edge = status === 'cumplido' ? 'border-l-emerald-500'
+                : status === 'pendiente' ? 'border-l-amber-500'
+                : 'border-l-slate-700';
+
+            const barColor = percentage >= 100 ? 'bg-emerald-500'
+                : percentage >= 75 ? 'bg-sky-500'
+                : percentage >= 50 ? 'bg-amber-500'
+                : percentage > 0 ? 'bg-orange-500'
+                : 'bg-slate-700';
+
+            const netTone = !hasData ? 'text-slate-600'
+                : net > 0 ? 'text-emerald-400'
+                : net < 0 ? 'text-rose-400'
+                : 'text-slate-400';
+
+            const margin = earned > 0 ? (net / earned) * 100 : 0;
+
+            return (
+                <div ref={ref}
+                     style={{ scrollMarginTop: '110px', scrollMarginBottom: '24px' }}
+                     className={`bg-slate-900 rounded-xl border border-slate-700/50 border-l-4 ${edge} p-3 transition-colors ${isToday ? 'ring-1 ring-sky-500/70 bg-slate-900/95' : ''}`}>
+                    <div className="flex justify-between items-start mb-3 gap-2">
+                        <div className="min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                                <h3 className="font-bold text-slate-100 text-[15px] num">{day.dateString}</h3>
+                                {isToday && (
+                                    <span className="bg-sky-500/15 text-sky-300 border border-sky-500/40 text-[9px] font-extrabold uppercase tracking-[0.14em] px-1.5 py-0.5 rounded">
+                                        Hoy
+                                    </span>
+                                )}
+                            </div>
+                            <p className="text-slate-500 text-[10px] uppercase tracking-wider font-bold mt-0.5">{day.dayName}</p>
+                        </div>
+                        <div className="text-right shrink-0">
+                            <span className={`text-lg font-bold num ${status === 'cumplido' ? 'text-emerald-400' : status === 'pendiente' ? 'text-amber-400' : 'text-slate-600'}`}>
+                                {percentage.toFixed(0)}%
+                            </span>
+                            <p className="text-[9px] uppercase tracking-wider text-slate-600 font-bold">cumplim.</p>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2 mb-3">
+                        <MoneyField id={`goal-${day.id}`} label="Meta" tone="goal" value={day.goal} onChange={(v) => onGoal(day.id, v)} />
+                        <MoneyField id={`earned-${day.id}`} label="Bruto" tone="earned" value={day.earned} onChange={(v) => onEarned(day.id, v)} />
+                        <MoneyField id={`gas-${day.id}`} label="Gasolina" tone="gas" value={day.gas} onChange={(v) => onGas(day.id, v)} />
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2 mb-2.5">
+                        <span className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">Neto del día</span>
+                        <span className="flex items-baseline gap-2">
+                            {hasData && earned > 0 && (
+                                <span className={`text-[10px] num font-semibold ${margin >= 70 ? 'text-emerald-500/80' : margin >= 50 ? 'text-amber-500/80' : 'text-rose-500/80'}`}>
+                                    {pct(margin, 0)} margen
+                                </span>
+                            )}
+                            <span className={`text-sm font-bold num ${netTone}`}>
+                                {hasData ? `$${money(net)}` : '—'}
+                            </span>
+                        </span>
+                    </div>
+
+                    <div className="w-full bg-slate-800 rounded-full h-1 overflow-hidden">
+                        <div className={`${barColor} h-1 rounded-full transition-all duration-300`}
+                             style={{ width: `${Math.min(percentage, 100)}%` }}></div>
+                    </div>
+                </div>
+            );
+        });
+
+        /* ============================================================
+           APP
+           ============================================================ */
+        function App() {
+            const [days, setDays] = useState(loadDays);
+            const [filter, setFilter] = useState('todos');
+            const [toolsOpen, setToolsOpen] = useState(false);
+            const [toast, setToast] = useState(null);
+            const [lastSavedAt, setLastSavedAt] = useState(null);
+
+            const dayRefs = useRef({});
+            const toastTimer = useRef(null);
+            const headerRef = useRef(null);
+            const [headerHeight, setHeaderHeight] = useState(52);
+
+            /* Día actual del sistema */
+            const todayId = useMemo(() => {
+                const d = new Date().getDate();
+                return d >= 1 && d <= TOTAL_DAYS ? d : null;
+            }, []);
+            const todayIndex = todayId ? todayId - 1 : TOTAL_DAYS - 1;
+
+            /* Persistencia bajo la misma clave del archivo original */
+            useEffect(() => {
+                try {
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(days));
+                    setLastSavedAt(new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }));
+                } catch (err) {
+                    /* Cuota llena o almacenamiento bloqueado: la app sigue operando en memoria. */
+                }
+            }, [days]);
+
+            const notify = useCallback((message, tone = 'ok') => {
+                setToast({ message, tone });
+                if (toastTimer.current) clearTimeout(toastTimer.current);
+                toastTimer.current = setTimeout(() => setToast(null), 3200);
+            }, []);
+
+            useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current); }, []);
+
+            /* La barra de filtros se ancla justo debajo de la cabecera, sin huecos ni solapes */
+            useEffect(() => {
+                const measure = () => {
+                    if (headerRef.current) setHeaderHeight(headerRef.current.offsetHeight);
+                };
+                measure();
+                window.addEventListener('resize', measure);
+                window.addEventListener('orientationchange', measure);
+                return () => {
+                    window.removeEventListener('resize', measure);
+                    window.removeEventListener('orientationchange', measure);
+                };
+            }, []);
+
+            /* ---------- Motor de telemetría ---------- */
+            const metrics = useMemo(() => {
+                let totalGoal = 0, totalEarned = 0, totalGas = 0;
+                let workedDays = 0, achievedDays = 0, goalDays = 0;
+                let bestDay = null;
+
+                days.forEach(day => {
+                    const goal = num(day.goal);
+                    const earned = num(day.earned);
+                    const gas = num(day.gas);
+
+                    totalGoal += goal;
+                    totalEarned += earned;
+                    totalGas += gas;
+
+                    if (goal > 0) goalDays += 1;
+                    if (earned > 0) {
+                        workedDays += 1;
+                        if (getDayStatus(day) === 'cumplido') achievedDays += 1;
+                        const net = earned - gas;
+                        if (!bestDay || net > bestDay.net) bestDay = { net: net, label: day.dateString };
+                    }
+                });
+
+                const netProfit = totalEarned - totalGas;
+                const margin = totalEarned > 0 ? (netProfit / totalEarned) * 100 : 0;
+                const fuelIndex = totalEarned > 0 ? (totalGas / totalEarned) * 100 : 0;
+                const avgGross = workedDays > 0 ? totalEarned / workedDays : 0;
+                const avgNet = workedDays > 0 ? netProfit / workedDays : 0;
+                const horizon = days.length || TOTAL_DAYS;
+
+                return {
+                    totalGoal, totalEarned, totalGas, netProfit, margin, fuelIndex,
+                    workedDays, achievedDays, goalDays, bestDay,
+                    avgGross, avgNet,
+                    projectedGross: avgGross * horizon,
+                    projectedNet: avgNet * horizon,
+                    goalProgress: totalGoal > 0 ? (totalEarned / totalGoal) * 100 : 0,
+                    effectiveness: workedDays > 0 ? (achievedDays / workedDays) * 100 : 0,
+                    remainingDays: Math.max(horizon - workedDays, 0)
+                };
+            }, [days]);
+
+            const counts = useMemo(() => {
+                const acc = { todos: days.length, cumplidos: 0, pendientes: 0, sin: 0 };
+                days.forEach(day => {
+                    const status = getDayStatus(day);
+                    if (status === 'cumplido') acc.cumplidos += 1;
+                    else if (status === 'pendiente') acc.pendientes += 1;
+                    else acc.sin += 1;
+                });
+                return acc;
+            }, [days]);
+
+            const visibleDays = useMemo(() => {
+                if (filter === 'todos') return days;
+                const wanted = filter === 'cumplidos' ? 'cumplido' : filter === 'pendientes' ? 'pendiente' : 'sin';
+                return days.filter(day => getDayStatus(day) === wanted);
+            }, [days, filter]);
+
+            /* ---------- Edición ---------- */
+            const updateField = useCallback((id, field, value) => {
+                setDays(prev => prev.map(day => day.id === id ? { ...day, [field]: value } : day));
+            }, []);
+
+            const handleGoal = useCallback((id, v) => updateField(id, 'goal', v), [updateField]);
+            const handleEarned = useCallback((id, v) => updateField(id, 'earned', v), [updateField]);
+            const handleGas = useCallback((id, v) => updateField(id, 'gas', v), [updateField]);
+
+            /* ---------- Navegación al día de hoy ---------- */
+            const scrollToToday = useCallback(() => {
+                if (!todayId) return;
+                if (filter !== 'todos') setFilter('todos');
+                requestAnimationFrame(() => {
+                    setTimeout(() => {
+                        const node = dayRefs.current[todayId];
+                        if (node && node.scrollIntoView) {
+                            node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        } else {
+                            notify('El día de hoy no está en este mes de registro', 'warn');
+                        }
+                    }, 60);
+                });
+            }, [todayId, filter, notify]);
+
+            /* ---------- Herramientas de datos ---------- */
+            const timestamp = () => {
+                const d = new Date();
+                const p = (n) => String(n).padStart(2, '0');
+                return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+            };
+
+            const downloadBlob = (content, filename, mime) => {
+                try {
+                    const blob = new Blob([content], { type: mime });
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = filename;
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    setTimeout(() => URL.revokeObjectURL(url), 1500);
+                    return true;
+                } catch (err) {
+                    return false;
+                }
+            };
+
+            const exportJson = () => {
+                const ok = downloadBlob(JSON.stringify(days, null, 2), `didi-respaldo-${timestamp()}.json`, 'application/json');
+                notify(ok ? 'Respaldo .json descargado' : 'No se pudo generar la descarga', ok ? 'ok' : 'warn');
+                setToolsOpen(false);
+            };
+
+            const exportCsv = () => {
+                const header = ['ID', 'Fecha', 'Dia', 'Meta', 'Bruto', 'Gasolina', 'Neto', 'Cumplimiento %'];
+                const escape = (cell) => {
+                    const text = String(cell);
+                    return /[",;\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+                };
+                const rows = days.map(day => {
+                    const goal = num(day.goal);
+                    const earned = num(day.earned);
+                    const gas = num(day.gas);
+                    return [
+                        day.id,
+                        day.dateString,
+                        day.dayName,
+                        goal.toFixed(2),
+                        earned.toFixed(2),
+                        gas.toFixed(2),
+                        (earned - gas).toFixed(2),
+                        getPercentage(earned, goal).toFixed(1)
+                    ].map(escape).join(',');
+                });
+                const totals = [
+                    'TOTAL', MONTH_LONG, '',
+                    metrics.totalGoal.toFixed(2),
+                    metrics.totalEarned.toFixed(2),
+                    metrics.totalGas.toFixed(2),
+                    metrics.netProfit.toFixed(2),
+                    metrics.goalProgress.toFixed(1)
+                ].map(escape).join(',');
+
+                const csv = '﻿' + [header.join(','), ...rows, totals].join('\r\n');
+                const ok = downloadBlob(csv, `didi-registro-${timestamp()}.csv`, 'text/csv;charset=utf-8;');
+                notify(ok ? 'CSV descargado para Excel' : 'No se pudo generar la descarga', ok ? 'ok' : 'warn');
+                setToolsOpen(false);
+            };
+
+            const importFile = (file) => {
+                const reader = new FileReader();
+                reader.onload = () => {
+                    try {
+                        const parsed = JSON.parse(String(reader.result));
+                        if (!Array.isArray(parsed) || parsed.length === 0) {
+                            notify('El archivo no contiene un respaldo válido', 'warn');
+                            return;
+                        }
+                        const valid = parsed.filter(item => item && typeof item === 'object');
+                        if (valid.length === 0) {
+                            notify('El archivo no contiene registros legibles', 'warn');
+                            return;
+                        }
+                        setDays(mergeWithBase(valid, buildBaseMonth()));
+                        setToolsOpen(false);
+                        notify(`Respaldo restaurado: ${valid.length} días`);
+                    } catch (err) {
+                        notify('Archivo dañado: revisa que sea el .json exportado', 'warn');
+                    }
+                };
+                reader.onerror = () => notify('No se pudo leer el archivo', 'warn');
+                reader.readAsText(file);
+            };
+
+            const clearAll = () => {
+                setDays(buildBaseMonth().map(day => ({ ...day, earned: '', gas: '' })));
+                setToolsOpen(false);
+                notify('Registros limpiados y metas restauradas');
+            };
+
+            /* ---------- Render ---------- */
+            const netTone = metrics.netProfit > 0 ? 'positive' : metrics.netProfit < 0 ? 'negative' : 'neutral';
+            const marginTone = metrics.margin >= 70 ? 'positive' : metrics.margin >= 50 ? 'warning' : metrics.totalEarned > 0 ? 'negative' : 'neutral';
+            const fuelTone = metrics.fuelIndex <= 25 ? 'positive' : metrics.fuelIndex <= 40 ? 'warning' : metrics.totalEarned > 0 ? 'negative' : 'neutral';
+
+            return (
+                <div className="min-h-screen bg-slate-950 font-sans antialiased">
+                    {/* Barra superior */}
+                    <header ref={headerRef} className="sticky top-0 z-30 bg-slate-950/95 backdrop-blur border-b border-slate-800"
+                            style={{ paddingTop: 'env(safe-area-inset-top, 0px)' }}>
+                        <div className="max-w-2xl mx-auto px-3 py-2.5 flex items-center justify-between gap-3">
+                            <div className="min-w-0">
+                                <h1 className="text-slate-100 font-bold tracking-tight text-[15px] leading-tight truncate">
+                                    Telemetría DiDi
+                                </h1>
+                                <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500 font-bold">{MONTH_LONG}</p>
+                            </div>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                                <button onClick={scrollToToday}
+                                        className="focus-ring flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700/60 text-sky-300 rounded-lg px-2.5 py-1.5 text-[11px] font-bold transition-colors"
+                                        aria-label="Ir al día de hoy">
+                                    <IconCrosshair size={15} />
+                                    <span className="num">Hoy {todayId || '—'}</span>
+                                </button>
+                                <button onClick={() => setToolsOpen(true)}
+                                        className="focus-ring bg-slate-900 hover:bg-slate-800 border border-slate-700/60 text-slate-300 rounded-lg p-2 transition-colors"
+                                        aria-label="Abrir gestión de datos">
+                                    <IconSliders size={16} />
+                                </button>
+                            </div>
+                        </div>
+                    </header>
+
+                    <main className="max-w-2xl mx-auto px-3 pb-16 pt-3 space-y-3">
+                        {/* Utilidad neta — cifra principal */}
+                        <section className="bg-slate-900 rounded-2xl border border-slate-700/50 p-4">
+                            <div className="flex items-start justify-between gap-3">
+                                <div>
+                                    <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500 font-bold mb-1">
+                                        Utilidad neta real
+                                    </p>
+                                    <p className={`text-3xl font-bold num tracking-tight ${metrics.netProfit >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                        ${money(metrics.netProfit)}
+                                    </p>
+                                    <p className="text-[11px] text-slate-500 num mt-1">
+                                        Bruto ${money(metrics.totalEarned)} − Gasolina ${money(metrics.totalGas)}
+                                    </p>
+                                </div>
+                                <div className="text-right shrink-0">
+                                    <span className={`inline-flex items-center gap-1 text-[11px] font-bold px-2 py-1 rounded-full border ${
+                                        metrics.margin >= 70 ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+                                        : metrics.margin >= 50 ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                                        : metrics.totalEarned > 0 ? 'bg-rose-500/10 text-rose-300 border-rose-500/30'
+                                        : 'bg-slate-800 text-slate-400 border-slate-700'}`}>
+                                        <IconGauge size={13} />
+                                        <span className="num">{pct(metrics.margin, 1)}</span>
+                                    </span>
+                                    <p className="text-[9px] uppercase tracking-wider text-slate-600 font-bold mt-1">margen op.</p>
+                                </div>
+                            </div>
+
+                            <div className="grid grid-cols-1 gap-3 mt-4 pt-4 border-t border-slate-800">
+                                <MeterRow label="Progreso sobre meta mensual"
+                                          value={metrics.goalProgress}
+                                          display={`${pct(metrics.goalProgress, 1)} · $${money(metrics.totalEarned, 0)} / $${money(metrics.totalGoal, 0)}`}
+                                          color="bg-emerald-500" />
+                                <MeterRow label="Índice de eficiencia de combustible"
+                                          value={metrics.fuelIndex}
+                                          display={`${pct(metrics.fuelIndex, 1)} del bruto`}
+                                          color={metrics.fuelIndex <= 25 ? 'bg-sky-500' : metrics.fuelIndex <= 40 ? 'bg-amber-500' : 'bg-rose-500'} />
+                                <MeterRow label="Efectividad de jornadas"
+                                          value={metrics.effectiveness}
+                                          display={`${metrics.achievedDays} de ${metrics.workedDays} días · ${pct(metrics.effectiveness, 0)}`}
+                                          color="bg-violet-500" />
+                            </div>
+                        </section>
+
+                        {/* Rejilla de métricas */}
+                        <section className="grid grid-cols-2 gap-2">
+                            <MetricTile icon={<IconTarget size={13} />} label="Meta mensual"
+                                        value={`$${money(metrics.totalGoal, 0)}`}
+                                        sub={`${metrics.goalDays} días con meta`} />
+                            <MetricTile icon={<IconWallet size={13} />} label="Ingreso bruto"
+                                        value={`$${money(metrics.totalEarned)}`} tone="positive"
+                                        sub={`Prom. $${money(metrics.avgGross)} / jornada`} />
+                            <MetricTile icon={<IconFuel size={13} />} label="Gasolina invertida"
+                                        value={`$${money(metrics.totalGas)}`} tone="negative"
+                                        sub={`${pct(metrics.fuelIndex, 1)} del bruto`} />
+                            <MetricTile icon={<IconGauge size={13} />} label="Tasa de retorno"
+                                        value={pct(metrics.margin, 1)} tone={marginTone}
+                                        sub={`Neto prom. $${money(metrics.avgNet)}`} />
+                            <MetricTile icon={<IconTrend size={13} />} label="Proyección bruta"
+                                        value={`$${money(metrics.projectedGross, 0)}`} tone="info"
+                                        sub={`Run-rate al día ${TOTAL_DAYS}`} />
+                            <MetricTile icon={<IconTrend size={13} />} label="Proyección neta"
+                                        value={`$${money(metrics.projectedNet, 0)}`} tone="info"
+                                        sub={`Base: ${metrics.workedDays} jornadas`} />
+                            <MetricTile icon={<IconCheck size={13} />} label="Jornadas cumplidas"
+                                        value={`${metrics.achievedDays}/${metrics.workedDays}`}
+                                        tone={metrics.effectiveness >= 60 ? 'positive' : metrics.workedDays > 0 ? 'warning' : 'neutral'}
+                                        sub={`${counts.pendientes} en progreso · ${counts.sin} sin registro`} />
+                            <MetricTile icon={<IconCalendar size={13} />} label="Mejor jornada"
+                                        value={metrics.bestDay ? `$${money(metrics.bestDay.net)}` : '—'}
+                                        sub={metrics.bestDay ? `${metrics.bestDay.label} · neto` : 'Sin registros aún'} />
+                        </section>
+
+                        {/* Gráfico acumulado */}
+                        <CumulativeSparkline days={days} todayIndex={todayIndex} projectedGross={metrics.projectedGross} />
+
+                        {/* Filtros rápidos */}
+                        <nav className="sticky z-20 -mx-3 px-3 py-2 bg-slate-950/95 backdrop-blur border-b border-slate-800/80"
+                             style={{ top: headerHeight + 'px' }}
+                             aria-label="Filtros de días">
+                            <div className="grid grid-cols-4 gap-1.5">
+                                <FilterChip active={filter === 'todos'} onClick={() => setFilter('todos')} label="Todos" count={counts.todos} accent="slate" />
+                                <FilterChip active={filter === 'cumplidos'} onClick={() => setFilter('cumplidos')} label="Cumplidos" count={counts.cumplidos} accent="emerald" />
+                                <FilterChip active={filter === 'pendientes'} onClick={() => setFilter('pendientes')} label="Progreso" count={counts.pendientes} accent="amber" />
+                                <FilterChip active={filter === 'sin'} onClick={() => setFilter('sin')} label="Sin registro" count={counts.sin} accent="slate" />
+                            </div>
+                        </nav>
+
+                        {/* Lista de días */}
+                        <section className="space-y-2.5">
+                            {visibleDays.length === 0 ? (
+                                <div className="bg-slate-900 border border-dashed border-slate-700 rounded-xl p-8 text-center">
+                                    <p className="text-slate-300 text-sm font-semibold">Sin días en este filtro</p>
+                                    <p className="text-slate-500 text-[12px] mt-1">Cambia el filtro para ver el resto del mes.</p>
+                                </div>
+                            ) : visibleDays.map(day => (
+                                <DayCard
+                                    key={day.id}
+                                    day={day}
+                                    isToday={day.id === todayId}
+                                    onGoal={handleGoal}
+                                    onEarned={handleEarned}
+                                    onGas={handleGas}
+                                    ref={(node) => { dayRefs.current[day.id] = node; }}
+                                />
+                            ))}
+                        </section>
+
+                        <p className="text-center text-[10px] text-slate-600 pt-2">
+                            Datos guardados en este dispositivo · clave <span className="num">{STORAGE_KEY}</span>
+                        </p>
+                    </main>
+
+                    <ToolsSheet
+                        open={toolsOpen}
+                        onClose={() => setToolsOpen(false)}
+                        onExportJson={exportJson}
+                        onExportCsv={exportCsv}
+                        onImportFile={importFile}
+                        onClearAll={clearAll}
+                        dayCount={days.length}
+                        lastSavedAt={lastSavedAt}
+                    />
+
+                    {toast && (
+                        <div className="fixed left-0 right-0 z-[60] flex justify-center px-4 pointer-events-none"
+                             style={{ bottom: 'calc(1rem + env(safe-area-inset-bottom, 0px))' }}
+                             role="status" aria-live="polite">
+                            <div className={`sheet-in flex items-center gap-2 rounded-xl border px-3.5 py-2.5 text-[12px] font-semibold shadow-lg ${
+                                toast.tone === 'warn'
+                                    ? 'bg-amber-950 border-amber-800/70 text-amber-200'
+                                    : 'bg-slate-800 border-slate-600/70 text-slate-100'}`}>
+                                {toast.tone === 'warn' ? <IconAlert size={15} /> : <IconCheck size={15} />}
+                                <span>{toast.message}</span>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const FilterChip = ({ active, onClick, label, count, accent }) => {
+            const activeClass = accent === 'emerald'
+                ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/50'
+                : accent === 'amber'
+                ? 'bg-amber-500/15 text-amber-300 border-amber-500/50'
+                : 'bg-slate-700 text-slate-100 border-slate-500';
+            return (
+                <button onClick={onClick} aria-pressed={active} title={`${label}: ${count} días`}
+                        className={`focus-ring min-w-0 flex flex-col items-center justify-center rounded-xl border px-1.5 py-1.5 transition-colors ${
+                            active ? activeClass : 'bg-slate-900 text-slate-400 border-slate-700/60 hover:text-slate-200'}`}>
+                    <span className="num text-[13px] font-bold leading-none">{count}</span>
+                    <span className="text-[9px] font-bold uppercase tracking-wider leading-none mt-1 truncate max-w-full">{label}</span>
+                </button>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
