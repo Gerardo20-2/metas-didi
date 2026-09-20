@@ -103,13 +103,11 @@
         /* Metas por defecto heredadas del archivo original, indexadas por día de la semana */
         const DEFAULT_GOALS = { 0: 1000, 1: 400, 2: 150, 3: 400, 4: 400, 5: 150, 6: 1000 };
 
-        /* Parámetros de costo vehicular por kilómetro (editables desde el menú) */
+        /* Parámetros operativos. Sin modelos teóricos: el dinero es el que entra y sale.
+           `earned` ya es el depósito neto de DiDi (comisiones e impuestos retenidos en origen),
+           así que la app nunca vuelve a descontarle nada que no sea un gasto real del turno. */
         const DEFAULT_COSTS = {
-            wearPerKm: 0.45,    // desgaste mecánico, neumáticos, aceite, fluidos
-            deprecPerKm: 0.35,  // depreciación del activo + seguro prorrateado
             avgTicket: 65,      // ticket promedio por viaje, para el calculador de turno
-            maintenanceRate: 8, // % del bruto apartado para mantenimiento y amortización
-            taxRate: 2.5,       // % del bruto apartado como resguardo fiscal / plataforma
             targetHourly: 120   // $/hr objetivo, benchmark del componente Desempeño del OEE
         };
 
@@ -301,14 +299,9 @@
                 stealth: base.stealth === true,
                 sound: base.sound !== false,          // realimentación sonora activa por defecto
                 defaultGoals: mergedGoals,
+                pacingMode: base.pacingMode === 'record' ? 'record' : 'relief',
                 costs: {
-                    wearPerKm: Number.isFinite(Number(costs.wearPerKm)) ? Number(costs.wearPerKm) : DEFAULT_COSTS.wearPerKm,
-                    deprecPerKm: Number.isFinite(Number(costs.deprecPerKm)) ? Number(costs.deprecPerKm) : DEFAULT_COSTS.deprecPerKm,
                     avgTicket: Number(costs.avgTicket) > 0 ? Number(costs.avgTicket) : DEFAULT_COSTS.avgTicket,
-                    maintenanceRate: Number.isFinite(Number(costs.maintenanceRate))
-                        ? clamp(Number(costs.maintenanceRate), 0, 100) : DEFAULT_COSTS.maintenanceRate,
-                    taxRate: Number.isFinite(Number(costs.taxRate))
-                        ? clamp(Number(costs.taxRate), 0, 100) : DEFAULT_COSTS.taxRate,
                     targetHourly: Number(costs.targetHourly) > 0
                         ? Number(costs.targetHourly) : DEFAULT_COSTS.targetHourly
                 }
@@ -459,43 +452,54 @@
         /* ============================================================================
            5. MOTOR DE CÁLCULO: COSTO REAL POR JORNADA
            ============================================================================ */
-        /* True Net Profit por día:
-           Costo operativo = gasolina + km * (desgaste + depreciación) + gastos extra
-           Utilidad real   = bruto - costo operativo                                   */
+        /* Flujo de caja real por día. `earned` ya es el depósito libre de la plataforma:
+           la app solo le resta dinero que salió de la cartera del conductor.
+           Salidas = gasolina + casetas + lavado + misceláneos de ruta
+           Bolsillo real   = depositado - gasolina - gastos de ruta                    */
         const computeDay = (day, costs) => {
             const goal = num(day.goal);
-            const earned = num(day.earned);
-            const gas = num(day.gas);
+            const earned = num(day.earned);        // depósito neto recibido de la plataforma
+            const gas = num(day.gas);              // combustible pagado de la cartera
             const hours = num(day.hours);
             const km = num(day.km);
             const tolls = num(day.tolls);
             const wash = num(day.wash);
             const misc = num(day.misc);
 
-            const extras = tolls + wash + misc;
-            const perKmRate = num(costs.wearPerKm) + num(costs.deprecPerKm);
-            const wear = km * perKmRate;
-            const opCost = gas + wear + extras;
+            /* Gastos de ruta en efectivo: casetas, lavado y misceláneos del turno */
+            const routeCash = tolls + wash + misc;
+            const cashOut = gas + routeCash;
+            const pocket = earned - cashOut;       // ganancia real de bolsillo
 
-            const netSimple = earned - gas;      // neto clásico (compatibilidad visual)
-            const trueNet = earned - opCost;     // utilidad neta real
+            const targetHourly = num(costs.targetHourly) > 0 ? num(costs.targetHourly) : DEFAULT_COSTS.targetHourly;
+            const realHourly = hours > 0 ? earned / hours : null;
+            const requiredHourly = hours > 0 && goal > 0 ? goal / hours : null;
+            const remainingToGoal = Math.max(goal - earned, 0);
+            /* Tiempo restante estimado al ritmo real de facturación */
+            const hoursToGoal = realHourly !== null && realHourly > 0 && remainingToGoal > 0
+                ? remainingToGoal / realHourly
+                : null;
 
             return {
                 goal, earned, gas, hours, km, tolls, wash, misc,
-                extras, wear, opCost, netSimple, trueNet, perKmRate,
-                hasData: earned > 0 || gas > 0 || extras > 0 || km > 0 || hours > 0,
-                /* Punto de equilibrio: bruto mínimo para cubrir el costo de la jornada */
-                breakEven: opCost,
-                breakEvenGap: opCost - earned,
-                coverage: opCost > 0 ? Math.min((earned / opCost) * 100, 999) : (earned > 0 ? 100 : 0),
+                routeCash, cashOut, pocket,
+                hasData: earned > 0 || gas > 0 || routeCash > 0 || km > 0 || hours > 0,
+                /* Punto de equilibrio: depósito mínimo para cubrir el efectivo del turno */
+                breakEven: cashOut,
+                breakEvenGap: cashOut - earned,
+                coverage: cashOut > 0 ? Math.min((earned / cashOut) * 100, 999) : (earned > 0 ? 100 : 0),
                 percentage: getPercentage(earned, goal),
                 status: getDayStatus(day),
-                margin: earned > 0 ? (trueNet / earned) * 100 : 0,
-                perHour: hours > 0 ? trueNet / hours : null,
-                grossPerHour: hours > 0 ? earned / hours : null,
+                /* Tasa de retorno efectiva: cuánto del depósito llega a la cartera */
+                returnRate: earned > 0 ? (pocket / earned) * 100 : 0,
+                /* Retención de combustible: cuánto se quedó en la gasolinera */
+                fuelRetention: earned > 0 ? (gas / earned) * 100 : 0,
+                routeRatio: earned > 0 ? (routeCash / earned) * 100 : 0,
+                realHourly, requiredHourly, hoursToGoal, targetHourly,
+                pocketPerHour: hours > 0 ? pocket / hours : null,
                 gasPerKm: km > 0 && gas > 0 ? gas / km : null,
-                costPerKm: km > 0 ? opCost / km : null,
-                netPerKm: km > 0 ? trueNet / km : null
+                cashPerKm: km > 0 ? cashOut / km : null,
+                pocketPerKm: km > 0 ? pocket / km : null
             };
         };
 
@@ -523,21 +527,23 @@
 
         /* Consolidado mensual: finanzas, pacing, proyecciones, estadística y series */
         const computeMonthMetrics = (days, costs, totalDaysInMonth) => {
-            let totalGoal = 0, totalEarned = 0, totalGas = 0, totalExtras = 0;
+            let totalGoal = 0, totalEarned = 0, totalGas = 0, totalRouteCash = 0;
             let totalTolls = 0, totalWash = 0, totalMisc = 0;
-            let totalWear = 0, totalOpCost = 0, totalKm = 0, totalHours = 0;
+            let totalCashOut = 0, totalKm = 0, totalHours = 0;
             let workedDays = 0, achievedDays = 0, goalDays = 0, pendingDays = 0, emptyDays = 0;
             let bestDay = null;
 
-            const netSeries = [];
+            const pocketSeries = [];
             const weekdayAcc = {};
-            WEEK_ORDER.forEach(wd => { weekdayAcc[wd] = { sum: 0, count: 0, gross: 0 }; });
+            WEEK_ORDER.forEach(wd => { weekdayAcc[wd] = { earned: 0, pocket: 0, count: 0 }; });
 
             const cumulativeGoal = [];
-            const cumulativeReal = [];
-            const dailyNet = [];
+            const cumulativeEarned = [];
+            const cumulativeGas = [];
+            const cumulativePocket = [];
+            const dailyPocket = [];
             const gasPerKmSamples = [];
-            let accGoal = 0, accReal = 0, lastWorkedIndex = -1;
+            let accGoal = 0, accEarned = 0, accGas = 0, accPocket = 0, lastWorkedIndex = -1;
 
             const computed = days.map((day, index) => {
                 const c = computeDay(day, costs);
@@ -545,20 +551,23 @@
                 totalGoal += c.goal;
                 totalEarned += c.earned;
                 totalGas += c.gas;
-                totalExtras += c.extras;
+                totalRouteCash += c.routeCash;
                 totalTolls += c.tolls;
                 totalWash += c.wash;
                 totalMisc += c.misc;
-                totalWear += c.wear;
-                totalOpCost += c.opCost;
+                totalCashOut += c.cashOut;
                 totalKm += c.km;
                 totalHours += c.hours;
 
                 accGoal += c.goal;
-                accReal += c.earned;
+                accEarned += c.earned;
+                accGas += c.gas;
+                accPocket += c.pocket;
                 cumulativeGoal.push(accGoal);
-                cumulativeReal.push(accReal);
-                dailyNet.push(c.trueNet);
+                cumulativeEarned.push(accEarned);
+                cumulativeGas.push(accGas);
+                cumulativePocket.push(accPocket);
+                dailyPocket.push(c.pocket);
 
                 if (c.goal > 0) goalDays += 1;
                 if (c.status === 'pendiente') pendingDays += 1;
@@ -567,16 +576,16 @@
                 if (c.earned > 0) {
                     workedDays += 1;
                     lastWorkedIndex = index;
-                    netSeries.push(c.trueNet);
+                    pocketSeries.push(c.pocket);
                     if (c.status === 'cumplido') achievedDays += 1;
-                    if (!bestDay || c.trueNet > bestDay.net) {
-                        bestDay = { net: c.trueNet, label: day.dateString, id: day.id };
+                    if (!bestDay || c.pocket > bestDay.pocket) {
+                        bestDay = { pocket: c.pocket, earned: c.earned, label: day.dateString, id: day.id };
                     }
                     const wd = DAYS_OF_WEEK.indexOf(day.dayName);
                     const bucket = wd >= 0 ? weekdayAcc[wd] : null;
                     if (bucket) {
-                        bucket.sum += c.trueNet;
-                        bucket.gross += c.earned;
+                        bucket.earned += c.earned;
+                        bucket.pocket += c.pocket;
                         bucket.count += 1;
                     }
                 }
@@ -585,102 +594,103 @@
                 return c;
             });
 
-            const netProfit = totalEarned - totalOpCost;
-            const netSimple = totalEarned - totalGas;
+            const pocketProfit = totalEarned - totalCashOut;
             const horizon = totalDaysInMonth || days.length || 1;
 
-            const avgGross = workedDays > 0 ? totalEarned / workedDays : 0;
-            const avgNet = workedDays > 0 ? netProfit / workedDays : 0;
+            const avgEarned = workedDays > 0 ? totalEarned / workedDays : 0;
+            const avgPocket = workedDays > 0 ? pocketProfit / workedDays : 0;
 
             const goalGap = totalGoal - totalEarned;
             const remainingDays = days.filter(d => num(d.earned) <= 0).length;
             const requiredDaily = goalGap > 0 && remainingDays > 0 ? goalGap / remainingDays : 0;
 
-            const spc = computeSpc(netSeries);
+            const spc = computeSpc(pocketSeries);
             const avgGasPerKm = gasPerKmSamples.length > 0
                 ? gasPerKmSamples.reduce((a, b) => a + b, 0) / gasPerKmSamples.length
                 : null;
 
+            /* Perfil de rendimiento por día de la semana: la demanda no es uniforme */
             const weekdayStats = WEEK_ORDER.map(wd => ({
                 weekday: wd,
                 label: DAY_SHORT[wd],
                 name: DAYS_OF_WEEK[wd],
                 count: weekdayAcc[wd].count,
-                avgNet: weekdayAcc[wd].count > 0 ? weekdayAcc[wd].sum / weekdayAcc[wd].count : 0,
-                avgGross: weekdayAcc[wd].count > 0 ? weekdayAcc[wd].gross / weekdayAcc[wd].count : 0
+                avgEarned: weekdayAcc[wd].count > 0 ? weekdayAcc[wd].earned / weekdayAcc[wd].count : 0,
+                avgPocket: weekdayAcc[wd].count > 0 ? weekdayAcc[wd].pocket / weekdayAcc[wd].count : 0
             }));
+            const weekdayMeans = {};
+            weekdayStats.forEach(stat => { weekdayMeans[stat.weekday] = stat; });
             const bestWeekday = weekdayStats.reduce(
-                (best, item) => (item.count > 0 && (!best || item.avgNet > best.avgNet) ? item : best), null);
+                (best, item) => (item.count > 0 && (!best || item.avgPocket > best.avgPocket) ? item : best), null);
+
+            /* Agrupación por tipo de demanda: base (lun-jue) contra fin de semana (vie-dom) */
+            const groupOf = (weekday) => (weekday === 5 || weekday === 6 || weekday === 0 ? 'peak' : 'base');
+            const clusters = { base: { earned: 0, pocket: 0, count: 0 }, peak: { earned: 0, pocket: 0, count: 0 } };
+            WEEK_ORDER.forEach(wd => {
+                const bucket = weekdayAcc[wd];
+                const target = clusters[groupOf(wd)];
+                target.earned += bucket.earned;
+                target.pocket += bucket.pocket;
+                target.count += bucket.count;
+            });
+            const clusterStats = {
+                base: {
+                    label: 'Demanda base', detail: 'Lun · Mar · Mié · Jue',
+                    count: clusters.base.count,
+                    avgEarned: clusters.base.count > 0 ? clusters.base.earned / clusters.base.count : 0,
+                    avgPocket: clusters.base.count > 0 ? clusters.base.pocket / clusters.base.count : 0
+                },
+                peak: {
+                    label: 'Alta demanda', detail: 'Vie · Sáb · Dom',
+                    count: clusters.peak.count,
+                    avgEarned: clusters.peak.count > 0 ? clusters.peak.earned / clusters.peak.count : 0,
+                    avgPocket: clusters.peak.count > 0 ? clusters.peak.pocket / clusters.peak.count : 0
+                }
+            };
 
             return {
                 computed,
-                totalGoal, totalEarned, totalGas, totalExtras, totalWear, totalOpCost,
+                totalGoal, totalEarned, totalGas, totalRouteCash, totalCashOut,
                 totalTolls, totalWash, totalMisc,
-                totalKm, totalHours, netProfit, netSimple,
-                margin: totalEarned > 0 ? (netProfit / totalEarned) * 100 : 0,
-                marginSimple: totalEarned > 0 ? (netSimple / totalEarned) * 100 : 0,
-                fuelRatio: totalEarned > 0 ? (totalGas / totalEarned) * 100 : 0,
-                vehicleRatio: totalEarned > 0 ? ((totalWear + totalExtras) / totalEarned) * 100 : 0,
+                totalKm, totalHours, pocketProfit,
+                /* Tasa de retorno efectiva y retención de combustible del mes */
+                returnRate: totalEarned > 0 ? (pocketProfit / totalEarned) * 100 : 0,
+                fuelRetention: totalEarned > 0 ? (totalGas / totalEarned) * 100 : 0,
+                routeRatio: totalEarned > 0 ? (totalRouteCash / totalEarned) * 100 : 0,
                 goalProgress: totalGoal > 0 ? (totalEarned / totalGoal) * 100 : 0,
                 workedDays, achievedDays, goalDays, pendingDays, emptyDays,
                 effectiveness: workedDays > 0 ? (achievedDays / workedDays) * 100 : 0,
-                avgGross, avgNet,
-                projectedGross: avgGross * horizon,
-                projectedNet: avgNet * horizon,
+                avgEarned, avgPocket,
+                projectedEarned: avgEarned * horizon,
+                projectedPocket: avgPocket * horizon,
                 goalGap, remainingDays, requiredDaily,
-                bestDay, bestWeekday, weekdayStats,
-                cumulativeGoal, cumulativeReal, dailyNet, lastWorkedIndex,
-                netPerHour: totalHours > 0 ? netProfit / totalHours : null,
-                grossPerHour: totalHours > 0 ? totalEarned / totalHours : null,
-                costPerKm: totalKm > 0 ? totalOpCost / totalKm : null,
+                bestDay, bestWeekday, weekdayStats, weekdayMeans, clusterStats,
+                cumulativeGoal, cumulativeEarned, cumulativeGas, cumulativePocket,
+                dailyPocket, lastWorkedIndex,
+                earnedPerHour: totalHours > 0 ? totalEarned / totalHours : null,
+                pocketPerHour: totalHours > 0 ? pocketProfit / totalHours : null,
+                cashPerKm: totalKm > 0 ? totalCashOut / totalKm : null,
                 avgGasPerKm,
                 spc
             };
         };
 
         /* ============================================================================
-           5b. FINANZAS DEFENSIVAS: EQUILIBRIO, PROVISIONES Y ESCENARIOS
+           5b. EQUILIBRIO DE CAJA, PROYECCIÓN ESTRATIFICADA Y PACING ADAPTATIVO
            ============================================================================ */
-        /* Traduce un umbral de equilibrio a los tres estados operativos del turno */
-        const breakEvenState = (earned, cost) => {
-            const gap = cost - earned;
-            if (cost <= 0 && earned <= 0) {
+        /* Traduce el umbral de equilibrio a los tres estados operativos del turno */
+        const breakEvenState = (earned, cashOut) => {
+            const gap = cashOut - earned;
+            if (cashOut <= 0 && earned <= 0) {
                 return { key: 'idle', label: 'Sin actividad', detail: 'Jornada sin registro', tone: 'slate', gap: 0 };
             }
             if (gap > 0.005) {
-                return {
-                    key: 'deficit', tone: 'rose', gap,
-                    label: 'En zona de déficit',
-                    detail: 'para llegar a tablas'
-                };
+                return { key: 'deficit', tone: 'rose', gap, label: 'En zona de déficit', detail: 'para llegar a tablas' };
             }
             if (gap >= -0.005) {
-                return {
-                    key: 'even', tone: 'amber', gap: 0,
-                    label: 'Punto de equilibrio alcanzado',
-                    detail: '100% de costos cubiertos'
-                };
+                return { key: 'even', tone: 'amber', gap: 0, label: 'Punto de equilibrio alcanzado', detail: 'gastos del turno cubiertos' };
             }
-            return {
-                key: 'profit', tone: 'emerald', gap: Math.abs(gap),
-                label: 'Utilidad neta positiva',
-                detail: 'limpios sobre el costo'
-            };
-        };
-
-        /* Sobres virtuales: se provisionan sobre el bruto, no sobre la utilidad */
-        const computeSinkingFunds = (grossIncome, netProfit, costs) => {
-            const gross = num(grossIncome);
-            const maintenanceRate = clamp(num(costs.maintenanceRate), 0, 100);
-            const taxRate = clamp(num(costs.taxRate), 0, 100);
-            const maintenance = gross * (maintenanceRate / 100);
-            const tax = gross * (taxRate / 100);
-            const provisioned = maintenance + tax;
-            return {
-                maintenance, tax, provisioned, maintenanceRate, taxRate,
-                freeCash: netProfit - provisioned,
-                provisionRatio: gross > 0 ? (provisioned / gross) * 100 : 0
-            };
+            return { key: 'profit', tone: 'emerald', gap: Math.abs(gap), label: 'Ganancia de bolsillo', detail: 'limpios a la cartera' };
         };
 
         /* Eficiencia de pacing: avance de meta contra avance del calendario */
@@ -688,9 +698,7 @@
             const elapsedRatio = totalDays > 0 ? clamp(elapsedDays / totalDays, 0, 1) * 100 : 0;
             const efficiency = elapsedRatio > 0 ? (goalProgress / elapsedRatio) * 100 : (goalProgress > 0 ? 200 : 0);
             return {
-                elapsedRatio,
-                efficiency,
-                expectedProgress: elapsedRatio,
+                elapsedRatio, efficiency, expectedProgress: elapsedRatio,
                 verdict: elapsedRatio <= 0 ? 'Mes sin iniciar'
                     : efficiency >= 100 ? 'Adelantado al calendario'
                     : efficiency >= 80 ? 'A ritmo de meta'
@@ -699,32 +707,108 @@
             };
         };
 
-        /* Simulador what-if: jornadas extra y variación del precio del combustible */
+        /* ---------------------------------------------------------------------------
+           Proyección estratificada por perfil de día.
+           En movilidad la demanda de un sábado no se parece a la de un martes, así que
+           cada jornada pendiente se proyecta con la media observada de SU día de la
+           semana; si ese día aún no tiene registros, cae de vuelta a su meta programada.
+           --------------------------------------------------------------------------- */
+        const projectStratified = (days, metrics) => {
+            const contributions = [];
+            let projected = metrics.totalEarned;
+            let fromHistory = 0, fromGoal = 0;
+
+            days.forEach(day => {
+                if (num(day.earned) > 0) return;                  // jornada ya registrada
+                const weekday = DAYS_OF_WEEK.indexOf(day.dayName);
+                const profile = weekday >= 0 ? metrics.weekdayMeans[weekday] : null;
+                const hasHistory = profile && profile.count > 0 && profile.avgEarned > 0;
+                const value = hasHistory ? profile.avgEarned : num(day.goal);
+
+                projected += value;
+                if (hasHistory) fromHistory += 1; else fromGoal += 1;
+                contributions.push({
+                    id: day.id, label: day.dateString, weekday,
+                    dayName: day.dayName, value, source: hasHistory ? 'historia' : 'meta'
+                });
+            });
+
+            const flat = metrics.projectedEarned;
+            return {
+                projected, contributions, fromHistory, fromGoal,
+                pendingDays: contributions.length,
+                flat,
+                delta: projected - flat,
+                /* Bolsillo proyectado con la misma tasa de retorno observada */
+                projectedPocket: metrics.returnRate !== 0
+                    ? projected * (metrics.returnRate / 100)
+                    : projected - metrics.totalCashOut,
+                surplus: projected - metrics.totalGoal
+            };
+        };
+
+        /* Simulador what-if: jornadas extra y variación del precio del combustible.
+           Solo mueve dinero real: depósito esperado, gasolina y gastos de ruta. */
         const simulateScenario = (metrics, fuelDeltaPct, extraDays) => {
             const worked = metrics.workedDays;
-            const avgGross = worked > 0 ? metrics.totalEarned / worked : 0;
+            const avgEarned = worked > 0 ? metrics.totalEarned / worked : 0;
             const avgGas = worked > 0 ? metrics.totalGas / worked : 0;
-            const avgOther = worked > 0 ? (metrics.totalWear + metrics.totalExtras) / worked : 0;
+            const avgRoute = worked > 0 ? metrics.totalRouteCash / worked : 0;
             const fuelFactor = 1 + (num(fuelDeltaPct) / 100);
             const days = Math.max(0, Math.round(num(extraDays)));
 
             const gasPerExtraDay = avgGas * fuelFactor;
-            const netPerExtraDay = avgGross - gasPerExtraDay - avgOther;
+            const pocketPerExtraDay = avgEarned - gasPerExtraDay - avgRoute;
 
-            const scenarioGross = metrics.totalEarned + avgGross * days;
-            const scenarioNet = metrics.netProfit + netPerExtraDay * days;
+            const scenarioEarned = metrics.totalEarned + avgEarned * days;
+            const scenarioPocket = metrics.pocketProfit + pocketPerExtraDay * days;
             const fuelImpact = (gasPerExtraDay - avgGas) * days;
-            /* Costo del alza sobre el combustible que aún falta por consumir este mes */
             const futureFuelImpact = avgGas * (fuelFactor - 1) * (days + metrics.remainingDays);
 
             return {
-                days, fuelFactor, avgGross, avgGas, avgOther,
-                netPerExtraDay, gasPerExtraDay,
-                scenarioGross, scenarioNet,
-                deltaNet: scenarioNet - metrics.netProfit,
+                days, fuelFactor, avgEarned, avgGas, avgRoute,
+                pocketPerExtraDay, gasPerExtraDay,
+                scenarioEarned, scenarioPocket,
+                deltaPocket: scenarioPocket - metrics.pocketProfit,
                 fuelImpact, futureFuelImpact,
-                scenarioMargin: scenarioGross > 0 ? (scenarioNet / scenarioGross) * 100 : 0,
+                scenarioReturn: scenarioEarned > 0 ? (scenarioPocket / scenarioEarned) * 100 : 0,
                 hasBaseline: worked > 0
+            };
+        };
+
+        /* ---------------------------------------------------------------------------
+           Rebalanceo dinámico de metas.
+           Modo alivio: el excedente ya ganado baja la cuota de los días que faltan.
+           Modo récord: las metas quedan fijas y se proyecta el sobrecumplimiento.
+           --------------------------------------------------------------------------- */
+        const rebalanceGoals = (days, metrics, projection) => {
+            const pending = days.filter(d => num(d.earned) <= 0);
+            const pendingGoal = pending.reduce((acc, d) => acc + num(d.goal), 0);
+            const remaining = Math.max(metrics.goalGap, 0);
+            const pendingCount = pending.length;
+
+            /* Modo alivio: repartir lo que falta entre las jornadas pendientes */
+            const reliefDaily = pendingCount > 0 ? remaining / pendingCount : 0;
+            const originalDaily = pendingCount > 0 ? pendingGoal / pendingCount : 0;
+            const dailyRelief = Math.max(originalDaily - reliefDaily, 0);
+            const reliefRatio = originalDaily > 0 ? (dailyRelief / originalDaily) * 100 : 0;
+
+            /* Modo récord: mantener la meta diaria y ver con cuánto se cierra */
+            const recordSurplus = projection.projected - metrics.totalGoal;
+
+            /* Descansos ganados: excedente acumulado sobre el ingreso medio de jornada */
+            const surplusNow = metrics.totalEarned - (metrics.totalGoal - pendingGoal);
+            const restDays = metrics.avgEarned > 0 ? surplusNow / metrics.avgEarned : 0;
+
+            return {
+                pendingCount, pendingGoal, remaining, originalDaily,
+                reliefDaily, dailyRelief, reliefRatio,
+                recordSurplus,
+                surplusNow,
+                earnedRest: Math.max(Math.floor(restDays), 0),
+                earnedRestFraction: Math.max(restDays, 0),
+                ahead: surplusNow > 0,
+                goalReached: metrics.goalGap <= 0
             };
         };
 
@@ -776,11 +860,12 @@
         /* Telemetría financiera consolidada del mes visible */
         const useFinancialTelemetry = (days, costs, elapsedDays) => useMemo(() => {
             const base = computeMonthMetrics(days, costs, days.length);
-            const funds = computeSinkingFunds(base.totalEarned, base.netProfit, costs);
             const pacing = computePacing(base.goalProgress, elapsedDays, days.length);
-            const equilibrium = breakEvenState(base.totalEarned, base.totalOpCost);
+            const equilibrium = breakEvenState(base.totalEarned, base.totalCashOut);
             const deficitDays = base.computed.filter(c => c.earned > 0 && c.breakEvenGap > 0.005).length;
-            return { ...base, funds, pacing, equilibrium, deficitDays };
+            const projection = projectStratified(days, base);
+            const rebalance = rebalanceGoals(days, base, projection);
+            return { ...base, pacing, equilibrium, deficitDays, projection, rebalance };
         }, [days, costs, elapsedDays]);
 
         /* ============================================================================
@@ -914,9 +999,9 @@
 
             const availability = scheduled > 0 ? clamp(worked / scheduled, 0, 1) : 0;
             const target = num(costs.targetHourly) > 0 ? num(costs.targetHourly) : DEFAULT_COSTS.targetHourly;
-            const realHourly = metrics.grossPerHour;
+            const realHourly = metrics.earnedPerHour;
             const performance = realHourly !== null && target > 0 ? clamp(realHourly / target, 0, 1.5) : null;
-            const quality = metrics.totalEarned > 0 ? clamp(metrics.netProfit / metrics.totalEarned, 0, 1) : 0;
+            const quality = metrics.totalEarned > 0 ? clamp(metrics.pocketProfit / metrics.totalEarned, 0, 1) : 0;
 
             const measurable = performance !== null;
             const oee = measurable ? availability * performance * quality : null;
@@ -937,7 +1022,7 @@
         const computeFuelElasticity = (computed) => {
             const points = computed
                 .filter(c => c.earned > 0 && c.gas > 0)
-                .map(c => ({ gas: c.gas, net: c.trueNet }))
+                .map(c => ({ gas: c.gas, net: c.pocket }))
                 .sort((a, b) => a.gas - b.gas);
 
             if (points.length < 3) {
@@ -972,20 +1057,20 @@
 
         /* Hook: envuelve los modelos pesados y los memoiza sobre la lista diferida */
         const usePredictiveModels = (days, metrics, costs, elapsedDays) => useMemo(() => {
-            const netSeries = [];
-            const grossSeries = [];
+            const pocketSeries = [];
+            const earnedSeries = [];
             days.forEach((day, index) => {
                 const c = metrics.computed[index];
                 if (c && c.earned > 0) {
-                    netSeries.push(c.trueNet);
-                    grossSeries.push(c.earned);
+                    pocketSeries.push(c.pocket);
+                    earnedSeries.push(c.earned);
                 }
             });
 
-            const worked = grossSeries.length;
-            const mu = worked > 0 ? grossSeries.reduce((a, b) => a + b, 0) / worked : 0;
+            const worked = earnedSeries.length;
+            const mu = worked > 0 ? earnedSeries.reduce((a, b) => a + b, 0) / worked : 0;
             const variance = worked > 0
-                ? grossSeries.reduce((acc, v) => acc + Math.pow(v - mu, 2), 0) / worked
+                ? earnedSeries.reduce((acc, v) => acc + Math.pow(v - mu, 2), 0) / worked
                 : 0;
             const sigma = Math.sqrt(variance);
 
@@ -994,13 +1079,13 @@
                                              metrics.totalEarned, metrics.totalGoal);
             const elapsedMs = performance && performance.now ? performance.now() - started : 0;
 
-            const holt = holtLinear(grossSeries);
-            const holtNet = holtLinear(netSeries);
+            const holt = holtLinear(earnedSeries);
+            const holtPocket = holtLinear(pocketSeries);
             const oee = computeOEE(metrics, elapsedDays, days, costs);
             const fuel = computeFuelElasticity(metrics.computed);
 
             return {
-                mu, sigma, worked, monteCarlo, holt, holtNet, oee, fuel, elapsedMs,
+                mu, sigma, worked, monteCarlo, holt, holtPocket, oee, fuel, elapsedMs,
                 cv: mu > 0 ? (sigma / mu) * 100 : 0,
                 enoughData: worked >= 3
             };
@@ -1175,9 +1260,10 @@
             const padL = 8, padR = 10, padT = 16, padB = 22;
             const count = days.length || 1;
 
-            const { cumulativeGoal, cumulativeReal, dailyNet, lastWorkedIndex, projectedGross } = metrics;
+            const { cumulativeGoal, cumulativeEarned, cumulativeGas, cumulativePocket,
+                    dailyPocket, lastWorkedIndex, projectedEarned } = metrics;
             const totalGoal = cumulativeGoal[count - 1] || 0;
-            const totalReal = cumulativeReal[count - 1] || 0;
+            const totalReal = cumulativeEarned[count - 1] || 0;
 
             const realEnd = clamp(Math.max(lastWorkedIndex, todayIndex >= 0 ? todayIndex : 0), 0, count - 1);
 
@@ -1185,11 +1271,11 @@
             const fan = useMemo(() => {
                 const steps = count - 1 - realEnd;
                 if (!prediction || !prediction.enoughData || steps <= 0 || prediction.mu <= 0) return null;
-                const band = fanBand(cumulativeReal[realEnd] || 0, prediction.mu, prediction.sigma, steps);
+                const band = fanBand(cumulativeEarned[realEnd] || 0, prediction.mu, prediction.sigma, steps);
                 return { ...band, steps };
-            }, [prediction, count, realEnd, cumulativeReal]);
+            }, [prediction, count, realEnd, cumulativeEarned]);
 
-            const maxY = Math.max(totalGoal, totalReal, projectedGross,
+            const maxY = Math.max(totalGoal, totalReal, projectedEarned,
                                   fan ? fan.high[fan.high.length - 1] : 0, 1);
 
             const x = useCallback((i) => padL + (i / Math.max(count - 1, 1)) * (W - padL - padR), [count]);
@@ -1199,16 +1285,20 @@
                 const toPath = (values, endIndex) => smoothPath(
                     values.slice(0, endIndex + 1).map((v, i) => ({ x: x(i), y: y(v) })));
                 const goalPath = toPath(cumulativeGoal, count - 1);
-                const realPath = toPath(cumulativeReal, realEnd);
-                const areaPath = `${realPath} L${x(realEnd).toFixed(1)},${y(0).toFixed(1)} L${x(0).toFixed(1)},${y(0).toFixed(1)} Z`;
-                const projPath = (projectedGross > 0 && realEnd < count - 1)
-                    ? `M${x(realEnd).toFixed(1)},${y(cumulativeReal[realEnd]).toFixed(1)} L${x(count - 1).toFixed(1)},${y(projectedGross).toFixed(1)}`
+                const realPath = toPath(cumulativeEarned, realEnd);
+                const pocketPath = toPath(cumulativePocket, realEnd);
+                /* Área entre depositado y bolsillo: el combustible y la ruta que se comieron el mes */
+                const pocketPoints = cumulativePocket.slice(0, realEnd + 1).map((v, i) => ({ x: x(i), y: y(v) }));
+                const gapPath = `${realPath} ${smoothPath(pocketPoints.slice().reverse()).replace(/^M/, 'L')} Z`;
+                const areaPath = `${pocketPath} L${x(realEnd).toFixed(1)},${y(0).toFixed(1)} L${x(0).toFixed(1)},${y(0).toFixed(1)} Z`;
+                const projPath = (projectedEarned > 0 && realEnd < count - 1)
+                    ? `M${x(realEnd).toFixed(1)},${y(cumulativeEarned[realEnd]).toFixed(1)} L${x(count - 1).toFixed(1)},${y(projectedEarned).toFixed(1)}`
                     : null;
 
                 let fanPath = null;
                 let fanMidPath = null;
                 if (fan) {
-                    const anchorPoint = { x: x(realEnd), y: y(cumulativeReal[realEnd] || 0) };
+                    const anchorPoint = { x: x(realEnd), y: y(cumulativeEarned[realEnd] || 0) };
                     const upper = [anchorPoint].concat(fan.high.map((v, i) => ({ x: x(realEnd + 1 + i), y: y(v) })));
                     const lower = [anchorPoint].concat(fan.low.map((v, i) => ({ x: x(realEnd + 1 + i), y: y(v) })));
                     const upperPath = smoothPath(upper);
@@ -1218,8 +1308,8 @@
                     fanMidPath = smoothPath([anchorPoint].concat(fan.mid.map((v, i) => ({ x: x(realEnd + 1 + i), y: y(v) }))));
                 }
 
-                return { goalPath, realPath, areaPath, projPath, fanPath, fanMidPath };
-            }, [cumulativeGoal, cumulativeReal, realEnd, count, projectedGross, fan, x, y]);
+                return { goalPath, realPath, pocketPath, gapPath, areaPath, projPath, fanPath, fanMidPath };
+            }, [cumulativeGoal, cumulativeEarned, cumulativePocket, realEnd, count, projectedEarned, fan, x, y]);
 
             const indexFromEvent = useCallback((clientX) => {
                 const node = svgRef.current;
@@ -1259,7 +1349,7 @@
             return (
                 <SectionCard
                     title="Curva de acumulación"
-                    subtitle="Arrastra el dedo sobre el gráfico para inspeccionar cualquier día"
+                    subtitle="El hueco rojo es el combustible y la ruta que se comieron el depósito"
                     action={<span className="text-[10px] uppercase tracking-widest text-slate-500 font-bold shrink-0 pt-1">Acumulado</span>}>
 
                     <div className="relative select-none">
@@ -1273,8 +1363,18 @@
                              onPointerLeave={(e) => { if (e.pointerType === 'mouse') { draggingRef.current = false; setCursor(null); } }}>
                             <defs>
                                 <linearGradient id="realFill" x1="0" y1="0" x2="0" y2="1">
-                                    <stop offset="0%" stopColor={COLORS.emerald} stopOpacity="0.32" />
-                                    <stop offset="100%" stopColor={COLORS.emerald} stopOpacity="0.02" />
+                                    <stop offset="0%" stopColor={COLORS.emerald} stopOpacity="0.34" />
+                                    <stop offset="100%" stopColor={COLORS.emerald} stopOpacity="0.04" />
+                                </linearGradient>
+                                {/* Hueco entre depositado y bolsillo: lo que se comieron gasolina y ruta */}
+                                <linearGradient id="gapFill" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor={COLORS.crimson} stopOpacity="0.46" />
+                                    <stop offset="100%" stopColor={COLORS.crimson} stopOpacity="0.20" />
+                                </linearGradient>
+                                {/* Abanico probabilístico P10–P90 */}
+                                <linearGradient id="fanFill" x1="0" y1="0" x2="1" y2="0">
+                                    <stop offset="0%" stopColor={COLORS.cyan} stopOpacity="0.30" />
+                                    <stop offset="100%" stopColor={COLORS.cyan} stopOpacity="0.12" />
                                 </linearGradient>
                             </defs>
 
@@ -1292,6 +1392,7 @@
                                       strokeWidth="1.2" strokeOpacity="0.55" strokeDasharray="1 4" strokeLinecap="round" />
                             )}
                             <path d={paths.areaPath} fill="url(#realFill)" stroke="none" />
+                            <path d={paths.gapPath} fill="url(#gapFill)" stroke="none" />
                             <path d={paths.goalPath} fill="none" stroke={COLORS.slate500} strokeWidth="1.9"
                                   strokeDasharray="5 4" strokeLinecap="round" />
                             {paths.projPath && (
@@ -1300,11 +1401,15 @@
                             )}
                             <path d={paths.realPath} fill="none" stroke={COLORS.emerald} strokeWidth="2.4"
                                   strokeLinecap="round" strokeLinejoin="round" />
+                            <path d={paths.pocketPath} fill="none" stroke="#34d399" strokeWidth="1.8"
+                                  strokeLinecap="round" strokeLinejoin="round" strokeOpacity="0.95" />
 
-                            <circle cx={x(realEnd)} cy={y(cumulativeReal[realEnd] || 0)} r="3.6"
+                            <circle cx={x(realEnd)} cy={y(cumulativeEarned[realEnd] || 0)} r="3.6"
                                     fill={COLORS.emerald} stroke="#022c22" strokeWidth="1.5" />
+                            <circle cx={x(realEnd)} cy={y(cumulativePocket[realEnd] || 0)} r="3"
+                                    fill="#34d399" stroke="#022c22" strokeWidth="1.4" />
                             {paths.projPath && (
-                                <circle cx={x(count - 1)} cy={y(projectedGross)} r="3"
+                                <circle cx={x(count - 1)} cy={y(projectedEarned)} r="3"
                                         fill="#0f172a" stroke={COLORS.cyan} strokeWidth="1.6" />
                             )}
 
@@ -1314,8 +1419,10 @@
                                           stroke={COLORS.cyan} strokeWidth="1" strokeDasharray="3 3" />
                                     <circle cx={x(cursor)} cy={y(cumulativeGoal[cursor] || 0)} r="3"
                                             fill="#0f172a" stroke={COLORS.slate300} strokeWidth="1.4" />
-                                    <circle cx={x(cursor)} cy={y(cumulativeReal[cursor] || 0)} r="3.8"
+                                    <circle cx={x(cursor)} cy={y(cumulativeEarned[cursor] || 0)} r="3.8"
                                             fill={COLORS.emerald} stroke="#022c22" strokeWidth="1.4" />
+                                    <circle cx={x(cursor)} cy={y(cumulativePocket[cursor] || 0)} r="3.2"
+                                            fill="#34d399" stroke="#022c22" strokeWidth="1.3" />
                                 </g>
                             )}
 
@@ -1340,8 +1447,10 @@
                                     </p>
                                     <div className="mt-1 space-y-0.5">
                                         <TooltipRow color={COLORS.slate500} label="Meta acum." value={cash(cumulativeGoal[cursor] || 0, 0)} />
-                                        <TooltipRow color={COLORS.emerald} label="Real acum." value={cash(cumulativeReal[cursor] || 0, 0)} />
-                                        <TooltipRow color={COLORS.cyan} label="Neto del día" value={cash(dailyNet[cursor] || 0)} />
+                                        <TooltipRow color={COLORS.emerald} label="Depositado" value={cash(cumulativeEarned[cursor] || 0, 0)} />
+                                        <TooltipRow color={COLORS.crimson} label="Gasolina" value={cash(cumulativeGas[cursor] || 0, 0)} />
+                                        <TooltipRow color="#34d399" label="Bolsillo" value={cash(cumulativePocket[cursor] || 0, 0)} />
+                                        <TooltipRow color={COLORS.cyan} label="Del día" value={cash(dailyPocket[cursor] || 0)} />
                                     </div>
                                 </div>
                             </div>
@@ -1349,9 +1458,18 @@
                     </div>
 
                     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-3 pt-3 border-t border-slate-800">
-                        <Legend color={COLORS.emerald} label="Real" value={cash(totalReal, 0)} />
+                        <Legend color={COLORS.emerald} label="Depositado" value={cash(totalReal, 0)} />
+                        <Legend color="#34d399" label="Bolsillo" value={cash(cumulativePocket[realEnd] || 0, 0)} />
+                        <span className="flex items-center gap-1.5 text-[11px]">
+                            <span className="inline-block w-4 h-2 rounded-sm shrink-0"
+                                  style={{ backgroundColor: COLORS.crimson, opacity: 0.42 }}></span>
+                            <span className="text-slate-400">Absorbido</span>
+                            <span className="text-slate-200 font-semibold num">
+                                {cash((cumulativeEarned[realEnd] || 0) - (cumulativePocket[realEnd] || 0), 0)}
+                            </span>
+                        </span>
                         <Legend color={COLORS.slate500} dashed label="Meta" value={cash(totalGoal, 0)} />
-                        {paths.projPath && <Legend color={COLORS.cyan} dashed label="Proyección" value={cash(projectedGross, 0)} />}
+                        {paths.projPath && <Legend color={COLORS.cyan} dashed label="Proyección" value={cash(projectedEarned, 0)} />}
                         {fan && (
                             <span className="flex items-center gap-1.5 text-[11px]">
                                 <span className="inline-block w-4 h-2 rounded-sm shrink-0"
@@ -1379,11 +1497,16 @@
                 const p1 = points[i];
                 const p2 = points[i + 1];
                 const p3 = points[i + 2] || p2;
+                /* Los límites van por min/max, no por orden de los puntos: una serie
+                   recorrida de derecha a izquierda (el borde inferior de un área cerrada)
+                   tiene p1.x > p2.x y colapsaría todos los controles sobre p1.x. */
                 const loY = Math.min(p1.y, p2.y);
                 const hiY = Math.max(p1.y, p2.y);
-                const c1x = clamp(p1.x + (p2.x - p0.x) * t, p1.x, p2.x);
+                const loX = Math.min(p1.x, p2.x);
+                const hiX = Math.max(p1.x, p2.x);
+                const c1x = clamp(p1.x + (p2.x - p0.x) * t, loX, hiX);
                 const c1y = clamp(p1.y + (p2.y - p0.y) * t, loY, hiY);
-                const c2x = clamp(p2.x - (p3.x - p1.x) * t, p1.x, p2.x);
+                const c2x = clamp(p2.x - (p3.x - p1.x) * t, loX, hiX);
                 const c2y = clamp(p2.y - (p3.y - p1.y) * t, loY, hiY);
                 d += ` C${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
             }
@@ -1434,7 +1557,7 @@
 
             const best = useMemo(() => {
                 let top = 0;
-                computed.forEach(c => { if (c.trueNet > top) top = c.trueNet; });
+                computed.forEach(c => { if (c.pocket > top) top = c.pocket; });
                 return top;
             }, [computed]);
 
@@ -1463,7 +1586,7 @@
                                 const isToday = day.id === todayId;
                                 return (
                                     <g key={day.id} onClick={() => { haptic(12); onPickDay(day.id); }} style={{ cursor: 'pointer' }}>
-                                        <title>{`${day.dateString} · ${cash(computed[index] ? computed[index].trueNet : 0)} neto · ${Math.round(computed[index] ? computed[index].percentage : 0)}%`}</title>
+                                        <title>{`${day.dateString} · ${cash(computed[index] ? computed[index].pocket : 0)} neto · ${Math.round(computed[index] ? computed[index].percentage : 0)}%`}</title>
                                         <rect x={col * (CELL + GAP)} y={TOP + row * (CELL + GAP)}
                                               width={CELL} height={CELL} rx="3"
                                               fill={style.fill} fillOpacity={style.opacity}
@@ -1503,7 +1626,7 @@
             const W = 320, H = 108, BASE = 84, TOP = 16;
             const slot = W / 7;
             const barW = 26;
-            const maxNet = Math.max(1, ...weekdayStats.map(s => Math.abs(s.avgNet)));
+            const maxNet = Math.max(1, ...weekdayStats.map(s => Math.abs(s.avgPocket)));
 
             return (
                 <SectionCard
@@ -1518,9 +1641,9 @@
                         <line x1="0" x2={W} y1={BASE} y2={BASE} stroke={COLORS.slate800} strokeWidth="1" />
                         {weekdayStats.map((stat, i) => {
                             const cx = i * slot + slot / 2;
-                            const ratio = Math.abs(stat.avgNet) / maxNet;
+                            const ratio = Math.abs(stat.avgPocket) / maxNet;
                             const height = stat.count > 0 ? Math.max(3, ratio * (BASE - TOP)) : 3;
-                            const positive = stat.avgNet >= 0;
+                            const positive = stat.avgPocket >= 0;
                             const yTop = positive ? BASE - height : BASE;
                             const isBest = bestWeekday && bestWeekday.weekday === stat.weekday && stat.count > 0;
                             const fill = stat.count === 0 ? COLORS.slate800 : positive ? COLORS.emerald : COLORS.crimson;
@@ -1532,7 +1655,7 @@
                                         <text x={cx} y={positive ? yTop - 4 : BASE + height + 9}
                                               fill={isBest ? COLORS.emerald : COLORS.slate500}
                                               fontSize="8" fontWeight="700" fontFamily="system-ui, sans-serif" textAnchor="middle">
-                                            {moneyShort(stat.avgNet)}
+                                            {moneyShort(stat.avgPocket)}
                                         </text>
                                     )}
                                     <text x={cx} y={H - 4} fill={isBest ? COLORS.slate300 : COLORS.slate500}
@@ -1546,7 +1669,7 @@
                     {bestWeekday && bestWeekday.count > 0 && (
                         <p className="text-[11px] text-slate-400 mt-2 pt-2 border-t border-slate-800">
                             Los <span className="text-slate-100 font-semibold">{bestWeekday.name}</span> dejan en promedio
-                            <span className="text-emerald-400 font-bold num"> {cash(bestWeekday.avgNet)}</span> netos
+                            <span className="text-emerald-400 font-bold num"> {cash(bestWeekday.avgPocket)}</span> netos
                             <span className="text-slate-500 num"> ({bestWeekday.count} {bestWeekday.count === 1 ? 'jornada' : 'jornadas'})</span>.
                         </p>
                     )}
@@ -1696,12 +1819,12 @@
                 : 'bg-slate-800';
 
             const netTone = !c.hasData ? 'text-slate-600'
-                : c.trueNet > 0 ? 'text-emerald-400'
-                : c.trueNet < 0 ? 'text-rose-400'
+                : c.pocket > 0 ? 'text-emerald-400'
+                : c.pocket < 0 ? 'text-rose-400'
                 : 'text-slate-400';
 
-            const isHigh = spcSamples >= 3 && c.earned > 0 && c.trueNet > ucl;
-            const isLow = spcSamples >= 3 && c.earned > 0 && c.trueNet < lcl;
+            const isHigh = spcSamples >= 3 && c.earned > 0 && c.pocket > ucl;
+            const isLow = spcSamples >= 3 && c.earned > 0 && c.pocket < lcl;
             const gasAlert = c.gasPerKm !== null && avgGasPerKm !== null
                 && avgGasPerKm > 0 && c.gasPerKm > avgGasPerKm * 1.25;
 
@@ -1835,9 +1958,11 @@
 
                         <div className="grid grid-cols-3 gap-2 mb-3">
                             <MoneyField id={`goal-${day.id}`} label="Meta" tone="goal" value={day.goal} onChange={set('goal')} />
-                            <MoneyField id={`earned-${day.id}`} label="Bruto" tone="earned" value={day.earned} onChange={set('earned')} />
+                            <MoneyField id={`earned-${day.id}`} label="Depositado" tone="earned" value={day.earned} onChange={set('earned')} />
                             <MoneyField id={`gas-${day.id}`} label="Gasolina" tone="gas" value={day.gas} onChange={set('gas')} />
                         </div>
+
+                        {c.hours > 0 && <ShiftSpeedometer day={day} costs={costs} />}
 
                         {/* Punto de equilibrio de la jornada */}
                         {c.hasData && (
@@ -1862,16 +1987,16 @@
                         )}
 
                         <div className="flex items-center justify-between gap-2 mb-2.5">
-                            <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">Neto real</span>
+                            <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">A la cartera</span>
                             <span className="flex items-baseline gap-2">
                                 {c.earned > 0 && (
                                     <span className={`text-[10px] num font-semibold ${
-                                        c.margin >= 70 ? 'text-emerald-500/80' : c.margin >= 50 ? 'text-amber-500/80' : 'text-rose-500/80'}`}>
-                                        {pctText(c.margin, 0)} margen
+                                        c.returnRate >= 70 ? 'text-emerald-500/80' : c.returnRate >= 50 ? 'text-amber-500/80' : 'text-rose-500/80'}`}>
+                                        {pctText(c.returnRate, 0)} a la cartera
                                     </span>
                                 )}
                                 <span className={`text-sm font-bold num ${netTone}`}>
-                                    {c.hasData ? cash(c.trueNet) : '—'}
+                                    {c.hasData ? cash(c.pocket) : '—'}
                                 </span>
                             </span>
                         </div>
@@ -1917,20 +2042,20 @@
                                     <DerivedStat label="Punto de equilibrio" value={cash(c.breakEven)}
                                                  hint={`Cobertura ${pctText(c.coverage, 0)}`}
                                                  tone={equilibrium.key === 'deficit' ? 'warn' : 'default'} />
-                                    <DerivedStat label="Neto por hora" value={c.perHour !== null ? cash(c.perHour) : '—'}
-                                                 hint={c.grossPerHour !== null ? `Bruto ${cash(c.grossPerHour)}/h` : 'Captura las horas'} />
+                                    <DerivedStat label="Neto por hora" value={c.pocketPerHour !== null ? cash(c.pocketPerHour) : '—'}
+                                                 hint={c.realHourly !== null ? `Depósito ${cash(c.realHourly)}/h` : 'Captura las horas'} />
                                     <DerivedStat label="Gasolina por km" value={c.gasPerKm !== null ? cash(c.gasPerKm) : '—'}
                                                  hint={c.gasPerKm !== null && avgGasPerKm ? `Promedio ${cash(avgGasPerKm)}` : 'Captura km y gasolina'}
                                                  tone={gasAlert ? 'warn' : 'default'} />
-                                    <DerivedStat label="Costo total por km" value={c.costPerKm !== null ? cash(c.costPerKm) : '—'}
-                                                 hint={`Desgaste ${cash(c.wear)}`} />
+                                    <DerivedStat label="Gasto por km" value={c.cashPerKm !== null ? cash(c.cashPerKm) : '—'}
+                                                 hint={`Ruta ${cash(c.routeCash)}`} />
                                 </div>
 
                                 <div className="flex items-center justify-between gap-2 rounded-lg bg-slate-950/60 border border-slate-800 px-2.5 py-2">
                                     <span className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">
-                                        Bruto − gasolina − desgaste − extras
+                                        Depositado − gasolina − gastos de ruta
                                     </span>
-                                    <span className={`text-[13px] font-bold num ${netTone}`}>{cash(c.trueNet)}</span>
+                                    <span className={`text-[13px] font-bold num ${netTone}`}>{cash(c.pocket)}</span>
                                 </div>
 
                                 <p className="text-[10px] text-slate-600 text-center">
@@ -2097,7 +2222,7 @@
                                         <p className="text-sm font-bold text-slate-100 num">{cash(c.goal, 0)}</p>
                                     </div>
                                     <div className="bg-slate-800/50 border border-slate-800 rounded-lg px-2 py-2 text-center">
-                                        <p className="text-[9px] uppercase tracking-wider text-emerald-500 font-bold">Bruto hoy</p>
+                                        <p className="text-[9px] uppercase tracking-wider text-emerald-500 font-bold">Depositado hoy</p>
                                         <p className="text-sm font-bold text-emerald-400 num">{cash(c.earned, 0)}</p>
                                     </div>
                                     <div className="bg-slate-800/50 border border-slate-800 rounded-lg px-2 py-2 text-center">
@@ -2108,7 +2233,7 @@
 
                                 <div>
                                     <p className="text-[10px] uppercase tracking-[0.12em] font-bold text-slate-500 mb-1.5">
-                                        Sumar viaje al bruto del día
+                                        Sumar viaje al depósito del día
                                     </p>
                                     <div className="grid grid-cols-4 gap-2">
                                         {[ticket, 100, 150, 250].map((amount, i) => (
@@ -2121,7 +2246,7 @@
                                 </div>
 
                                 <div className="grid grid-cols-2 gap-2">
-                                    <MoneyField id="shift-earned" label="Bruto acumulado del día" tone="earned"
+                                    <MoneyField id="shift-earned" label="Depositado del día" tone="earned"
                                                 value={day.earned} onChange={(v) => onField(day.id, 'earned', v)} />
                                     <MoneyField id="shift-gas" label="Gasolina del día" tone="gas"
                                                 value={day.gas} onChange={(v) => onField(day.id, 'gas', v)} />
@@ -2129,8 +2254,8 @@
 
                                 <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-3 space-y-1.5">
                                     <p className="flex justify-between text-[11px]">
-                                        <span className="text-slate-400">Neto real del día</span>
-                                        <span className={`font-bold num ${c.trueNet >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>{cash(c.trueNet)}</span>
+                                        <span className="text-slate-300">Bolsillo del día</span>
+                                        <span className={`font-bold num ${c.pocket >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>{cash(c.pocket)}</span>
                                     </p>
                                     <p className="flex justify-between text-[11px]">
                                         <span className="text-slate-400">Cuota diaria pendiente del mes</span>
@@ -2169,7 +2294,7 @@
         function ToolsSheet({
             open, onClose, costs, onCostChange, monthName, dayCount, storedMonths, lastSavedAt,
             onExportMonth, onExportAll, onImportFile, onExportCsv, onCopySummary, onClearMonth,
-            soundOn, onToggleSound
+            onExportCard, soundOn, onToggleSound
         }) {
             const [armed, setArmed] = useState(false);
             const fileRef = useRef(null);
@@ -2184,7 +2309,6 @@
 
             if (!open) return null;
 
-            const perKm = num(costs.wearPerKm) + num(costs.deprecPerKm);
 
             return (
                 <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center" role="dialog" aria-modal="true" aria-label="Herramientas y respaldo">
@@ -2207,38 +2331,21 @@
                             </button>
                         </div>
 
-                        {/* Parámetros de costo por kilómetro */}
-                        <p className="text-[10px] uppercase tracking-[0.12em] font-bold text-slate-500 mb-2">
-                            Costo vehicular por kilómetro
+                        {/* Parámetros operativos */}
+                        <p className="text-[10px] uppercase tracking-[0.12em] font-bold text-slate-300 mb-2">
+                            Parámetros de la jornada
                         </p>
-                        <div className="grid grid-cols-3 gap-2">
-                            <MoneyField id="cost-wear" label="Desgaste" tone="ops" compact
-                                        value={costs.wearPerKm} onChange={(v) => onCostChange('wearPerKm', v)} />
-                            <MoneyField id="cost-deprec" label="Deprec./seguro" tone="ops" compact
-                                        value={costs.deprecPerKm} onChange={(v) => onCostChange('deprecPerKm', v)} />
-                            <MoneyField id="cost-ticket" label="Ticket prom." tone="unit" compact
+                        <div className="grid grid-cols-2 gap-2">
+                            <MoneyField id="cost-ticket" label="Ticket promedio" tone="unit" compact
                                         value={costs.avgTicket} onChange={(v) => onCostChange('avgTicket', v)} />
-                        </div>
-                        <p className="text-[11px] text-slate-500 mt-2 num">
-                            Cada kilómetro recorrido descuenta <span className="text-amber-300 font-bold">${money(perKm)}</span> de
-                            la utilidad (mantenimiento, llantas, depreciación y seguro).
-                        </p>
-
-                        <p className="text-[10px] uppercase tracking-[0.12em] font-bold text-slate-500 mt-5 mb-2">
-                            Sobres virtuales (% del bruto)
-                        </p>
-                        <div className="grid grid-cols-3 gap-2">
-                            <MoneyField id="fund-maintenance" label="Mantenimiento" tone="ops" prefix="%" compact
-                                        value={costs.maintenanceRate} onChange={(v) => onCostChange('maintenanceRate', v)} />
-                            <MoneyField id="fund-tax" label="Resguardo fiscal" tone="unit" prefix="%" compact
-                                        value={costs.taxRate} onChange={(v) => onCostChange('taxRate', v)} />
                             <MoneyField id="target-hourly" label="Meta $/hr" tone="goal" compact
                                         value={costs.targetHourly} onChange={(v) => onCostChange('targetHourly', v)} />
                         </div>
-                        <p className="text-[11px] text-slate-500 mt-2 num">
-                            Se aparta <span className="text-violet-300 font-bold">
-                            {money(num(costs.maintenanceRate) + num(costs.taxRate), 1)}%</span> de cada peso bruto antes de
-                            considerar la utilidad como disponible.
+                        <p className="text-[11px] text-slate-400 mt-2">
+                            El ticket promedio alimenta el cálculo de viajes restantes; la meta por hora es el
+                            referente del componente de desempeño. La app no descuenta comisiones ni impuestos:
+                            lo que capturas en <span className="text-emerald-300 font-semibold">Depositado</span> ya
+                            es el dinero libre que DiDi te transfirió.
                         </p>
 
                         {/* Respaldo y auditoría */}
@@ -2258,6 +2365,8 @@
                                    }} />
                             <SheetButton onClick={onExportCsv} icon={<IconGrid size={18} />} accent="violet"
                                          title="Exportar reporte CSV" detail="Con horas, km y $/hr · listo para Excel" />
+                            <SheetButton onClick={onExportCard} icon={<IconLayers size={18} />} accent="emerald"
+                                         title="Exportar ficha de rendimiento" detail="Imagen .png 1080×1920 lista para compartir" />
                             <SheetButton onClick={onCopySummary} icon={<IconClipboard size={18} />} accent="amber"
                                          title="Copiar resumen ejecutivo" detail="Texto listo para WhatsApp o notas" />
                         </div>
@@ -2590,7 +2699,7 @@
                                             <MiniStat label="Mañana" value={cash(prediction.holt.forecast, 0)} tone="text-sky-300" />
                                         </div>
                                         <p className="text-[10px] text-slate-400 mt-1.5">
-                                            Proyección del bruto de la próxima jornada, amortiguando días atípicos.
+                                            Proyección del depósito de la próxima jornada, amortiguando días atípicos.
                                         </p>
                                     </div>
 
@@ -2662,77 +2771,186 @@
         );
 
         /* ============================================================================
-           15c. SOBRES VIRTUALES (SINKING FUNDS)
+           15c. PACING ADAPTATIVO Y PROYECCIÓN POR PERFIL DE DÍA
            ============================================================================ */
-        function SinkingFundsPanel({ funds, netProfit, grossIncome }) {
+        function PacingStrategyPanel({ metrics, mode, onMode }) {
             const { cash } = useCash();
-            const [open, setOpen] = useState(false);
-            const share = (value) => (netProfit > 0 ? clamp((value / netProfit) * 100, 0, 100) : 0);
+            const { rebalance, projection } = metrics;
+            const relief = mode === 'relief';
 
             return (
-                <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
-                    <button onClick={() => { setOpen(o => !o); haptic(10); }} aria-expanded={open}
-                            className="focus-ring w-full flex items-center justify-between gap-3 p-4 text-left">
-                        <span className="flex items-center gap-2 min-w-0">
-                            <span className="text-violet-400 shrink-0"><IconLayers size={16} /></span>
-                            <span className="min-w-0">
-                                <span className="block text-slate-100 text-sm font-semibold tracking-tight">Sobres virtuales</span>
-                                <span className="block text-slate-500 text-[11px] truncate num">
-                                    Flujo libre {cash(funds.freeCash)} · provisionado {cash(funds.provisioned)}
-                                </span>
-                            </span>
-                        </span>
-                        <span className={`shrink-0 text-slate-400 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}>
-                            <IconChevronD size={18} />
-                        </span>
-                    </button>
+                <section className="bg-slate-900 rounded-2xl border border-slate-800 p-4">
+                    <div className="flex items-start justify-between gap-3 mb-3">
+                        <div className="min-w-0">
+                            <h2 className="text-slate-100 text-sm font-semibold tracking-tight">Estrategia de cuota</h2>
+                            <p className="text-slate-400 text-[11px]">
+                                {rebalance.pendingCount} {rebalance.pendingCount === 1 ? 'jornada pendiente' : 'jornadas pendientes'} ·
+                                faltan {cash(rebalance.remaining, 0)}
+                            </p>
+                        </div>
+                    </div>
 
-                    {open && (
-                        <div className="px-4 pb-4 space-y-2.5 fade-in">
-                            <FundRow color="bg-amber-500" tone="text-amber-300"
-                                     label="Mantenimiento y amortización"
-                                     detail={`${money(funds.maintenanceRate, 1)}% del bruto · llantas, frenos, servicio`}
-                                     value={cash(funds.maintenance)} percent={share(funds.maintenance)} />
-                            <FundRow color="bg-sky-500" tone="text-sky-300"
-                                     label="Resguardo fiscal y plataforma"
-                                     detail={`${money(funds.taxRate, 1)}% del bruto · retención estimada`}
-                                     value={cash(funds.tax)} percent={share(funds.tax)} />
-                            <div className={`flex items-center justify-between gap-2 rounded-xl border px-3 py-2.5 ${
-                                funds.freeCash >= 0 ? 'bg-emerald-950/25 border-emerald-900/40' : 'bg-rose-950/25 border-rose-900/50'}`}>
-                                <span className="min-w-0">
-                                    <span className="block text-[11px] font-bold text-slate-100">Flujo libre de bolsillo</span>
-                                    <span className="block text-[10px] text-slate-500 num">Neto real menos provisiones</span>
-                                </span>
-                                <span className={`text-base font-bold num shrink-0 ${
-                                    funds.freeCash >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>
-                                    {cash(funds.freeCash)}
-                                </span>
-                            </div>
-                            <p className="text-[10px] text-slate-600 leading-relaxed">
-                                Las provisiones se calculan sobre el bruto acumulado ({cash(grossIncome, 0)}); ajusta los
-                                porcentajes en el menú de control. Aparta ese dinero antes de gastarlo: no es utilidad disponible.
+                    {/* Conmutador de estrategia */}
+                    <div className="grid grid-cols-2 gap-2 mb-3">
+                        <button onClick={() => { onMode('relief'); feedback.tap(); }}
+                                aria-pressed={relief} style={{ minHeight: '56px' }}
+                                className={`focus-ring press rounded-xl border px-3 text-left transition-colors ${
+                                    relief ? 'bg-emerald-500/15 border-emerald-500/60 text-emerald-200'
+                                           : 'bg-slate-800/50 border-slate-700 text-slate-300'}`}>
+                            <span className="block text-[12px] font-bold">Alivio de jornada</span>
+                            <span className="block text-[10px] opacity-80">Bajar la cuota diaria</span>
+                        </button>
+                        <button onClick={() => { onMode('record'); feedback.tap(); }}
+                                aria-pressed={!relief} style={{ minHeight: '56px' }}
+                                className={`focus-ring press rounded-xl border px-3 text-left transition-colors ${
+                                    !relief ? 'bg-sky-500/15 border-sky-500/60 text-sky-200'
+                                            : 'bg-slate-800/50 border-slate-700 text-slate-300'}`}>
+                            <span className="block text-[12px] font-bold">Modo récord</span>
+                            <span className="block text-[10px] opacity-80">Mantener el ritmo</span>
+                        </button>
+                    </div>
+
+                    {relief ? (
+                        <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3 py-3">
+                            {rebalance.goalReached ? (
+                                <>
+                                    <p className="text-[11px] uppercase tracking-wider text-slate-300 font-bold">Meta mensual cubierta</p>
+                                    <p className="text-2xl font-bold num text-emerald-400 mt-1">
+                                        +{cash(Math.abs(metrics.goalGap), 0)}
+                                    </p>
+                                    <p className="text-[11px] text-slate-400 mt-1">
+                                        Las jornadas que faltan son ganancia libre: no necesitas cuota para cerrar el mes.
+                                    </p>
+                                </>
+                            ) : (
+                                <>
+                                    <p className="text-[11px] uppercase tracking-wider text-slate-300 font-bold">
+                                        Nueva cuota por jornada pendiente
+                                    </p>
+                                    <div className="flex items-baseline gap-2 mt-1">
+                                        <p className="text-2xl font-bold num text-emerald-400">{cash(rebalance.reliefDaily, 0)}</p>
+                                        {rebalance.dailyRelief > 0.5 && (
+                                            <span className="text-[12px] font-bold num text-slate-400 line-through">
+                                                {cash(rebalance.originalDaily, 0)}
+                                            </span>
+                                        )}
+                                    </div>
+                                    <p className="text-[11px] text-slate-400 mt-1">
+                                        {rebalance.dailyRelief > 0.5
+                                            ? `Ganas ${cash(rebalance.dailyRelief, 0)} menos por día (${pctText(rebalance.reliefRatio, 0)} de alivio) y aun así cierras el 100% de la meta.`
+                                            : 'Todavía no hay excedente que repartir: la cuota sigue igual a la meta programada.'}
+                                    </p>
+                                </>
+                            )}
+                        </div>
+                    ) : (
+                        <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3 py-3">
+                            <p className="text-[11px] uppercase tracking-wider text-slate-300 font-bold">
+                                Cierre proyectado manteniendo las metas
+                            </p>
+                            <p className={`text-2xl font-bold num mt-1 ${
+                                rebalance.recordSurplus >= 0 ? 'text-sky-300' : 'text-amber-300'}`}>
+                                {rebalance.recordSurplus >= 0 ? '+' : ''}{cash(rebalance.recordSurplus, 0)}
+                            </p>
+                            <p className="text-[11px] text-slate-400 mt-1">
+                                {rebalance.recordSurplus >= 0
+                                    ? `Vas rumbo a cerrar con ${cash(rebalance.recordSurplus, 0)} sobre tu meta mensual.`
+                                    : `A este perfil de días te quedarías ${cash(Math.abs(rebalance.recordSurplus), 0)} corto: hay que subir el ritmo.`}
                             </p>
                         </div>
                     )}
+
+                    {/* Descansos ganados */}
+                    <div className="flex items-center justify-between gap-2 rounded-xl bg-slate-950/60 border border-slate-800 px-3 py-2.5 mt-2">
+                        <span className="min-w-0">
+                            <span className="block text-[11px] font-bold text-slate-100">Días de descanso ganados</span>
+                            <span className="block text-[10px] text-slate-400 num">
+                                Excedente {cash(rebalance.surplusNow, 0)} ÷ jornada media {cash(metrics.avgEarned, 0)}
+                            </span>
+                        </span>
+                        <span className={`text-2xl font-extrabold num shrink-0 ${
+                            rebalance.earnedRest > 0 ? 'text-emerald-400' : 'text-slate-400'}`}>
+                            {rebalance.earnedRest}
+                        </span>
+                    </div>
+
+                    {/* Proyección estratificada */}
+                    <div className="mt-3 pt-3 border-t border-slate-800">
+                        <div className="flex items-center justify-between gap-2">
+                            <span className="text-[11px] font-bold text-slate-100">Proyección por perfil de día</span>
+                            <span className="text-base font-bold num text-slate-100">{cash(projection.projected, 0)}</span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2 mt-2">
+                            <ClusterCard cluster={metrics.clusterStats.base} tone="sky" />
+                            <ClusterCard cluster={metrics.clusterStats.peak} tone="emerald" />
+                        </div>
+                        <p className="text-[10px] text-slate-400 mt-2 num">
+                            {projection.fromHistory} días proyectados con su media histórica ·
+                            {' '}{projection.fromGoal} con su meta programada ·
+                            {' '}{projection.delta >= 0 ? '+' : ''}{cash(projection.delta, 0)} frente al promedio plano.
+                        </p>
+                    </div>
                 </section>
             );
         }
 
-        const FundRow = ({ color, tone, label, detail, value, percent }) => (
-            <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3 py-2.5">
-                <div className="flex items-center justify-between gap-2">
-                    <span className="min-w-0">
-                        <span className={`block text-[11px] font-bold ${tone}`}>{label}</span>
-                        <span className="block text-[10px] text-slate-500 num truncate">{detail}</span>
-                    </span>
-                    <span className="text-sm font-bold num text-slate-100 shrink-0">{value}</span>
+        const ClusterCard = ({ cluster, tone }) => {
+            const { cash } = useCash();
+            const accent = tone === 'emerald' ? 'text-emerald-400' : 'text-sky-300';
+            return (
+                <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-2.5 py-2">
+                    <p className="text-[10px] font-bold text-slate-100 truncate">{cluster.label}</p>
+                    <p className="text-[9px] text-slate-400 truncate">{cluster.detail}</p>
+                    <p className={`text-base font-bold num mt-0.5 ${accent}`}>
+                        {cluster.count > 0 ? cash(cluster.avgEarned, 0) : '—'}
+                    </p>
+                    <p className="text-[9px] text-slate-400 num">
+                        {cluster.count > 0 ? `${cluster.count} ${cluster.count === 1 ? 'jornada' : 'jornadas'}` : 'sin registro'}
+                    </p>
                 </div>
-                <div className="w-full bg-slate-900 rounded-full h-1 overflow-hidden mt-2">
-                    <div className={`${color} h-1 rounded-full transition-all duration-500`}
-                         style={{ width: `${clamp(percent, 0, 100)}%` }}></div>
+            );
+        };
+
+        /* ============================================================================
+           15c-2. VELOCÍMETRO DE TURNO EN VIVO
+           ============================================================================ */
+        function ShiftSpeedometer({ day, costs }) {
+            const { cash } = useCash();
+            const c = useMemo(() => (day ? computeDay(day, costs) : null), [day, costs]);
+            if (!c || c.hours <= 0) return null;
+
+            const ratio = c.requiredHourly && c.requiredHourly > 0 && c.realHourly !== null
+                ? clamp((c.realHourly / c.requiredHourly) * 100, 0, 150)
+                : null;
+            const hours = c.hoursToGoal !== null ? Math.floor(c.hoursToGoal) : null;
+            const minutes = c.hoursToGoal !== null ? Math.round((c.hoursToGoal - hours) * 60) : null;
+
+            return (
+                <div className="rounded-xl bg-slate-950/60 border border-slate-800 px-3 py-2.5 mb-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">Ritmo del turno</span>
+                        <span className="text-[13px] font-bold num text-sky-300">{cash(c.realHourly)}/h</span>
+                    </div>
+                    {c.requiredHourly !== null && (
+                        <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden mt-2">
+                            <div className={`h-1.5 rounded-full transition-all duration-500 ${
+                                ratio >= 100 ? 'bg-emerald-500' : ratio >= 70 ? 'bg-amber-500' : 'bg-rose-500'}`}
+                                 style={{ width: `${clamp(ratio || 0, 0, 100)}%` }}></div>
+                        </div>
+                    )}
+                    <p className="text-[11px] text-slate-400 mt-1.5">
+                        {c.hoursToGoal === null
+                            ? (c.earned >= c.goal && c.goal > 0
+                                ? 'Meta del día liberada.'
+                                : 'Captura el depósito del día para estimar el cierre.')
+                            : `A este ritmo, liberas la meta en ~${hours} h ${String(minutes).padStart(2, '0')} min.`}
+                        {c.requiredHourly !== null && c.hoursToGoal !== null && (
+                            <span className="text-slate-400"> Objetivo {cash(c.requiredHourly)}/h.</span>
+                        )}
+                    </p>
                 </div>
-            </div>
-        );
+            );
+        }
 
         /* ============================================================================
            15d. SIMULADOR DE SENSIBILIDAD WHAT-IF
@@ -2746,7 +2964,7 @@
             const scenario = useMemo(
                 () => simulateScenario(metrics, fuelDelta, extraDays), [metrics, fuelDelta, extraDays]);
 
-            const deltaTone = scenario.deltaNet >= 0 ? 'text-emerald-400' : 'text-rose-300';
+            const deltaTone = scenario.deltaPocket >= 0 ? 'text-emerald-400' : 'text-rose-300';
 
             return (
                 <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
@@ -2813,20 +3031,20 @@
 
                                     <div className="grid grid-cols-2 gap-2 mt-4">
                                         <div className="rounded-xl bg-slate-800/50 border border-slate-800 px-3 py-2.5">
-                                            <p className="text-[9px] uppercase tracking-wider text-slate-500 font-bold">Neto simulado</p>
-                                            <p className="text-lg font-bold num text-slate-100">{cash(scenario.scenarioNet, 0)}</p>
+                                            <p className="text-[9px] uppercase tracking-wider text-slate-300 font-bold">Bolsillo simulado</p>
+                                            <p className="text-lg font-bold num text-slate-100">{cash(scenario.scenarioPocket, 0)}</p>
                                             <p className={`text-[10px] font-bold num ${deltaTone}`}>
-                                                {scenario.deltaNet >= 0 ? '+' : ''}{cash(scenario.deltaNet, 0)} vs. hoy
+                                                {scenario.deltaPocket >= 0 ? '+' : ''}{cash(scenario.deltaPocket, 0)} vs. hoy
                                             </p>
                                         </div>
                                         <div className="rounded-xl bg-slate-800/50 border border-slate-800 px-3 py-2.5">
-                                            <p className="text-[9px] uppercase tracking-wider text-slate-500 font-bold">Neto por jornada extra</p>
+                                            <p className="text-[9px] uppercase tracking-wider text-slate-300 font-bold">Bolsillo por jornada extra</p>
                                             <p className={`text-lg font-bold num ${
-                                                scenario.netPerExtraDay >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>
-                                                {cash(scenario.netPerExtraDay, 0)}
+                                                scenario.pocketPerExtraDay >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>
+                                                {cash(scenario.pocketPerExtraDay, 0)}
                                             </p>
-                                            <p className="text-[10px] text-slate-500 num">
-                                                Bruto {cash(scenario.avgGross, 0)} · gas {cash(scenario.gasPerExtraDay, 0)}
+                                            <p className="text-[10px] text-slate-400 num">
+                                                Depósito {cash(scenario.avgEarned, 0)} · gas {cash(scenario.gasPerExtraDay, 0)}
                                             </p>
                                         </div>
                                     </div>
@@ -2845,8 +3063,8 @@
                                             </span>
                                         </p>
                                         <p className="flex justify-between text-[11px]">
-                                            <span className="text-slate-400">Margen del escenario</span>
-                                            <span className="font-bold num text-slate-100">{pctText(scenario.scenarioMargin, 1)}</span>
+                                            <span className="text-slate-300">Retorno efectivo del escenario</span>
+                                            <span className="font-bold num text-slate-100">{pctText(scenario.scenarioReturn, 1)}</span>
                                         </p>
                                     </div>
                                 </>
@@ -2919,7 +3137,7 @@
                                                 transform={`rotate(-90 ${CX} ${CY})`} />
                                     </svg>
                                     <div className="absolute inset-0 flex flex-col items-center justify-center">
-                                        <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 font-bold">Bruto de hoy</p>
+                                        <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 font-bold">Depositado hoy</p>
                                         <p className={`text-[44px] leading-none font-extrabold num text-emerald-400 ${stealth ? 'stealth-blur' : ''}`}>
                                             {stealth ? '$ ••••' : '$' + money(animatedEarned, 0)}
                                         </p>
@@ -2955,12 +3173,12 @@
                                 <div className="grid grid-cols-3 gap-2 mt-4">
                                     <HudStat label="Meta" value={cash(c.goal, 0)} />
                                     <HudStat label="Gasolina" value={cash(c.gas, 0)} tone="text-rose-400" />
-                                    <HudStat label="Neto real" value={cash(c.trueNet, 0)}
-                                             tone={c.trueNet >= 0 ? 'text-emerald-400' : 'text-rose-300'} />
+                                    <HudStat label="Bolsillo" value={cash(c.pocket, 0)}
+                                             tone={c.pocket >= 0 ? 'text-emerald-400' : 'text-rose-300'} />
                                 </div>
 
                                 <div className="grid grid-cols-2 gap-2 mt-3 mb-2">
-                                    <MoneyField id="hud-earned" label="Corregir bruto" tone="earned"
+                                    <MoneyField id="hud-earned" label="Corregir depósito" tone="earned"
                                                 value={day.earned} onChange={(v) => onField(day.id, 'earned', v)} />
                                     <MoneyField id="hud-gas" label="Gasolina cargada" tone="gas"
                                                 value={day.gas} onChange={(v) => onField(day.id, 'gas', v)} />
@@ -2982,6 +3200,224 @@
                 <p className={`text-base font-bold num ${tone}`}>{value}</p>
             </div>
         );
+
+        /* ============================================================================
+           15e-2. FICHA DE RENDIMIENTO EN CANVAS NATIVO (PNG 1080x1920 @2x)
+           ============================================================================ */
+        const CARD_W = 540, CARD_H = 960, CARD_DPR = 2;
+
+        const renderPerformanceCard = (metrics, monthName, generatedAt) => {
+            const canvas = document.createElement('canvas');
+            canvas.width = CARD_W * CARD_DPR;
+            canvas.height = CARD_H * CARD_DPR;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return null;
+            ctx.scale(CARD_DPR, CARD_DPR);          // se dibuja en coordenadas lógicas
+
+            const font = (size, weight = '700') =>
+                `${weight} ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+            const fmt = (value, decimals = 0) => '$' + money(value, decimals);
+
+            /* Fondo con degradado sutil */
+            const backdrop = ctx.createLinearGradient(0, 0, 0, CARD_H);
+            backdrop.addColorStop(0, '#0b1220');
+            backdrop.addColorStop(0.45, '#020617');
+            backdrop.addColorStop(1, '#020617');
+            ctx.fillStyle = backdrop;
+            ctx.fillRect(0, 0, CARD_W, CARD_H);
+
+            /* Halo esmeralda detrás de la cifra principal */
+            const halo = ctx.createRadialGradient(CARD_W / 2, 300, 20, CARD_W / 2, 300, 260);
+            halo.addColorStop(0, 'rgba(16, 185, 129, 0.20)');
+            halo.addColorStop(1, 'rgba(16, 185, 129, 0)');
+            ctx.fillStyle = halo;
+            ctx.fillRect(0, 60, CARD_W, 480);
+
+            const roundRect = (x, y, w, h, r) => {
+                ctx.beginPath();
+                ctx.moveTo(x + r, y);
+                ctx.arcTo(x + w, y, x + w, y + h, r);
+                ctx.arcTo(x + w, y + h, x, y + h, r);
+                ctx.arcTo(x, y + h, x, y, r);
+                ctx.arcTo(x, y, x + w, y, r);
+                ctx.closePath();
+            };
+
+            /* Encabezado */
+            ctx.textAlign = 'left';
+            ctx.fillStyle = '#10b981';
+            ctx.font = font(13, '800');
+            ctx.fillText('TELEMETRÍA DIDI', 40, 66);
+            ctx.fillStyle = '#f1f5f9';
+            ctx.font = font(30, '800');
+            ctx.fillText(monthName, 40, 104);
+            ctx.fillStyle = '#64748b';
+            ctx.font = font(13, '600');
+            ctx.fillText(`Generada el ${generatedAt}`, 40, 128);
+
+            ctx.strokeStyle = '#1e293b';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(40, 152);
+            ctx.lineTo(CARD_W - 40, 152);
+            ctx.stroke();
+
+            /* Cifra monumental: ganancia de bolsillo */
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = font(14, '700');
+            ctx.fillText('GANANCIA REAL DE BOLSILLO', CARD_W / 2, 210);
+            ctx.fillStyle = metrics.pocketProfit >= 0 ? '#10b981' : '#f43f5e';
+            ctx.font = font(74, '800');
+            ctx.fillText(fmt(metrics.pocketProfit, 0), CARD_W / 2, 282);
+            ctx.fillStyle = '#64748b';
+            ctx.font = font(14, '600');
+            ctx.fillText(`Retorno efectivo ${pctText(metrics.returnRate, 1)} de lo depositado`, CARD_W / 2, 312);
+
+            /* Tarjetas de métricas */
+            const tiles = [
+                { label: 'DEPOSITADO', value: fmt(metrics.totalEarned, 0), color: '#34d399' },
+                { label: 'GASOLINA', value: fmt(metrics.totalGas, 0), color: '#fb7185' },
+                { label: 'RETENCIÓN GAS', value: pctText(metrics.fuelRetention, 1), color: '#fbbf24' },
+                { label: 'GASTOS DE RUTA', value: fmt(metrics.totalRouteCash, 0), color: '#c4b5fd' },
+                { label: 'HORAS', value: `${money(metrics.totalHours, 1)} h`, color: '#7dd3fc' },
+                { label: 'KILÓMETROS', value: `${money(metrics.totalKm, 0)} km`, color: '#7dd3fc' }
+            ];
+            const tileW = (CARD_W - 80 - 24) / 3;
+            const tileH = 78;
+            tiles.forEach((tile, i) => {
+                const col = i % 3;
+                const row = Math.floor(i / 3);
+                const x = 40 + col * (tileW + 12);
+                const y = 350 + row * (tileH + 12);
+                ctx.fillStyle = '#0f172a';
+                roundRect(x, y, tileW, tileH, 14);
+                ctx.fill();
+                ctx.strokeStyle = '#1e293b';
+                ctx.stroke();
+                ctx.textAlign = 'left';
+                ctx.fillStyle = '#94a3b8';
+                ctx.font = font(10, '800');
+                ctx.fillText(tile.label, x + 12, y + 26);
+                ctx.fillStyle = tile.color;
+                ctx.font = font(20, '800');
+                ctx.fillText(tile.value, x + 12, y + 56);
+            });
+
+            /* Curva de avance dibujada sobre el canvas */
+            const chartX = 40, chartY = 540, chartW = CARD_W - 80, chartH = 180;
+            ctx.fillStyle = '#0f172a';
+            roundRect(chartX, chartY, chartW, chartH, 16);
+            ctx.fill();
+            ctx.strokeStyle = '#1e293b';
+            ctx.stroke();
+
+            ctx.textAlign = 'left';
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = font(11, '800');
+            ctx.fillText('AVANCE ACUMULADO', chartX + 16, chartY + 26);
+
+            const series = metrics.cumulativeEarned;
+            const pocketSeries = metrics.cumulativePocket;
+            const goalSeries = metrics.cumulativeGoal;
+            const maxValue = Math.max(goalSeries[goalSeries.length - 1] || 0,
+                                      series[series.length - 1] || 0, 1);
+            const plotX = chartX + 16, plotY = chartY + 40;
+            const plotW = chartW - 32, plotH = chartH - 66;
+            const pointAt = (arr, i) => ({
+                x: plotX + (i / Math.max(arr.length - 1, 1)) * plotW,
+                y: plotY + plotH - (clamp(arr[i] / maxValue, 0, 1)) * plotH
+            });
+            const lastIndex = Math.max(metrics.lastWorkedIndex, 0);
+
+            /* Meta acumulada punteada */
+            ctx.setLineDash([5, 4]);
+            ctx.strokeStyle = '#475569';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            goalSeries.forEach((v, i) => {
+                const pt = pointAt(goalSeries, i);
+                if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
+            });
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            /* Área de bolsillo */
+            if (lastIndex > 0) {
+                ctx.beginPath();
+                for (let i = 0; i <= lastIndex; i += 1) {
+                    const pt = pointAt(pocketSeries, i);
+                    if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
+                }
+                const endPoint = pointAt(pocketSeries, lastIndex);
+                ctx.lineTo(endPoint.x, plotY + plotH);
+                ctx.lineTo(plotX, plotY + plotH);
+                ctx.closePath();
+                const fill = ctx.createLinearGradient(0, plotY, 0, plotY + plotH);
+                fill.addColorStop(0, 'rgba(16, 185, 129, 0.35)');
+                fill.addColorStop(1, 'rgba(16, 185, 129, 0.05)');
+                ctx.fillStyle = fill;
+                ctx.fill();
+
+                /* Curva de depósito */
+                ctx.strokeStyle = '#10b981';
+                ctx.lineWidth = 3;
+                ctx.lineJoin = 'round';
+                ctx.beginPath();
+                for (let i = 0; i <= lastIndex; i += 1) {
+                    const pt = pointAt(series, i);
+                    if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
+                }
+                ctx.stroke();
+            }
+
+            ctx.textAlign = 'right';
+            ctx.fillStyle = '#64748b';
+            ctx.font = font(11, '600');
+            ctx.fillText(`${pctText(metrics.goalProgress, 1)} de la meta`, chartX + chartW - 16, chartY + 26);
+
+            /* Pie: efectividad y mejor jornada */
+            const footY = 760;
+            const footW = (CARD_W - 80 - 12) / 2;
+            const footTiles = [
+                {
+                    label: 'EFECTIVIDAD DE JORNADAS',
+                    value: `${metrics.achievedDays}/${metrics.workedDays}`,
+                    detail: `${pctText(metrics.effectiveness, 0)} con meta cumplida`
+                },
+                {
+                    label: 'MEJOR JORNADA',
+                    value: metrics.bestDay ? fmt(metrics.bestDay.pocket, 0) : '—',
+                    detail: metrics.bestDay ? `${metrics.bestDay.label} · de bolsillo` : 'Sin registros'
+                }
+            ];
+            footTiles.forEach((tile, i) => {
+                const x = 40 + i * (footW + 12);
+                ctx.fillStyle = '#0f172a';
+                roundRect(x, footY, footW, 96, 16);
+                ctx.fill();
+                ctx.strokeStyle = '#1e293b';
+                ctx.stroke();
+                ctx.textAlign = 'left';
+                ctx.fillStyle = '#94a3b8';
+                ctx.font = font(10, '800');
+                ctx.fillText(tile.label, x + 14, footY + 26);
+                ctx.fillStyle = '#f1f5f9';
+                ctx.font = font(26, '800');
+                ctx.fillText(tile.value, x + 14, footY + 60);
+                ctx.fillStyle = '#64748b';
+                ctx.font = font(11, '600');
+                ctx.fillText(tile.detail, x + 14, footY + 82);
+            });
+
+            /* Firma */
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#334155';
+            ctx.font = font(11, '600');
+            ctx.fillText('Registro personal de jornadas · datos locales del dispositivo', CARD_W / 2, 900);
+
+            return canvas;
+        };
 
         /* ============================================================================
            15f. DOCK ERGONÓMICO DE UNA MANO (THUMB ZONE)
@@ -3230,8 +3666,8 @@
                 deferredList.forEach((day, i) => {
                     const c = computed[i];
                     if (!c || c.earned <= 0) return;
-                    if (c.trueNet > spc.ucl) result.push({ id: day.id, label: day.dateString, net: c.trueNet, type: 'high' });
-                    else if (c.trueNet < spc.lcl) result.push({ id: day.id, label: day.dateString, net: c.trueNet, type: 'low' });
+                    if (c.pocket > spc.ucl) result.push({ id: day.id, label: day.dateString, net: c.pocket, type: 'high' });
+                    else if (c.pocket < spc.lcl) result.push({ id: day.id, label: day.dateString, net: c.pocket, type: 'low' });
                 });
                 return result;
             }, [deferredList, deferredMetrics]);
@@ -3329,6 +3765,10 @@
 
             const handleCostChange = useCallback((field, value) => {
                 setMeta(prev => ({ ...prev, costs: { ...prev.costs, [field]: value === '' ? 0 : num(value) } }));
+            }, []);
+
+            const setPacingMode = useCallback((mode) => {
+                setMeta(prev => ({ ...prev, pacingMode: mode }));
             }, []);
 
             const toggleStealth = useCallback(() => {
@@ -3515,8 +3955,9 @@
             }, [year, monthIndex, meta.defaultGoals, goToMonth, notify]);
 
             const exportCsv = useCallback(() => {
-                const header = ['ID', 'Fecha', 'Dia', 'Meta', 'Bruto', 'Gasolina', 'Neto', 'Cumplimiento %',
-                                'Horas', 'Km', '$/hr', 'Casetas', 'Lavado', 'Varios', 'Costo Vehicular', 'Neto Real'];
+                const header = ['ID', 'Fecha', 'Dia', 'Meta', 'Depositado', 'Gasolina', 'Casetas', 'Lavado',
+                                'Varios', 'Gasto Total', 'Ganancia Bolsillo', 'Cumplimiento %', 'Retencion Gas %',
+                                'Retorno Efectivo %', 'Horas', 'Km', '$/hr Bolsillo'];
                 const escape = (cell) => {
                     const text = String(cell);
                     return /[",;\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
@@ -3526,21 +3967,22 @@
                     return [
                         day.id, day.dateString, day.dayName,
                         c.goal.toFixed(2), c.earned.toFixed(2), c.gas.toFixed(2),
-                        c.netSimple.toFixed(2), c.percentage.toFixed(1),
-                        c.hours ? c.hours.toFixed(2) : '', c.km ? c.km.toFixed(2) : '',
-                        c.perHour !== null ? c.perHour.toFixed(2) : '',
                         c.tolls.toFixed(2), c.wash.toFixed(2), c.misc.toFixed(2),
-                        c.wear.toFixed(2), c.trueNet.toFixed(2)
+                        c.cashOut.toFixed(2), c.pocket.toFixed(2), c.percentage.toFixed(1),
+                        c.fuelRetention.toFixed(1), c.returnRate.toFixed(1),
+                        c.hours ? c.hours.toFixed(2) : '', c.km ? c.km.toFixed(2) : '',
+                        c.pocketPerHour !== null ? c.pocketPerHour.toFixed(2) : ''
                     ].map(escape).join(',');
                 });
                 const totals = [
                     'TOTAL', monthLabel(year, monthIndex), '',
                     metrics.totalGoal.toFixed(2), metrics.totalEarned.toFixed(2), metrics.totalGas.toFixed(2),
-                    metrics.netSimple.toFixed(2), metrics.goalProgress.toFixed(1),
-                    metrics.totalHours.toFixed(2), metrics.totalKm.toFixed(2),
-                    metrics.netPerHour !== null ? metrics.netPerHour.toFixed(2) : '',
                     metrics.totalTolls.toFixed(2), metrics.totalWash.toFixed(2), metrics.totalMisc.toFixed(2),
-                    metrics.totalWear.toFixed(2), metrics.netProfit.toFixed(2)
+                    metrics.totalCashOut.toFixed(2), metrics.pocketProfit.toFixed(2),
+                    metrics.goalProgress.toFixed(1), metrics.fuelRetention.toFixed(1),
+                    metrics.returnRate.toFixed(1),
+                    metrics.totalHours.toFixed(2), metrics.totalKm.toFixed(2),
+                    metrics.pocketPerHour !== null ? metrics.pocketPerHour.toFixed(2) : ''
                 ].map(escape).join(',');
 
                 const csv = '﻿' + [header.join(','), ...rows, totals].join('\r\n');
@@ -3553,22 +3995,22 @@
                 const lines = [
                     `Telemetria DiDi - ${monthLabel(year, monthIndex)}`,
                     '',
-                    `Bruto: $${money(metrics.totalEarned)}`,
-                    `Gasolina: $${money(metrics.totalGas)}`,
-                    `Desgaste + depreciacion: $${money(metrics.totalWear)}`,
-                    `Gastos extra: $${money(metrics.totalExtras)}`,
-                    `Utilidad neta real: $${money(metrics.netProfit)}`,
-                    `Margen operativo: ${pctText(metrics.margin)}`,
+                    `Depositado: $${money(metrics.totalEarned)}`,
+                    `Gasolina: $${money(metrics.totalGas)} (${pctText(metrics.fuelRetention)} del deposito)`,
+                    `Gastos de ruta: $${money(metrics.totalRouteCash)}`,
+                    `Ganancia de bolsillo: $${money(metrics.pocketProfit)}`,
+                    `Retorno efectivo: ${pctText(metrics.returnRate)}`,
                     '',
                     `Jornadas: ${metrics.workedDays} de ${totalDays} (${metrics.achievedDays} con meta cumplida)`,
                     `Avance de meta: ${pctText(metrics.goalProgress)} de $${money(metrics.totalGoal, 0)}`,
                     metrics.goalGap > 0
                         ? `Falta: $${money(metrics.goalGap, 0)} (cuota diaria $${money(metrics.requiredDaily, 0)})`
                         : `Meta superada por $${money(Math.abs(metrics.goalGap), 0)}`,
-                    `Proyeccion al cierre: $${money(metrics.projectedGross, 0)} bruto / $${money(metrics.projectedNet, 0)} neto`
+                    `Proyeccion por perfil de dia: $${money(metrics.projection.projected, 0)} depositado`,
+                    `Proyeccion de bolsillo: $${money(metrics.projection.projectedPocket, 0)}`
                 ];
-                if (metrics.totalKm > 0) lines.push(`Kilometros: ${money(metrics.totalKm, 0)} km · costo $${money(metrics.costPerKm || 0)}/km`);
-                if (metrics.totalHours > 0) lines.push(`Horas: ${money(metrics.totalHours, 1)} h · $${money(metrics.netPerHour || 0)}/h neto`);
+                if (metrics.totalKm > 0) lines.push(`Kilometros: ${money(metrics.totalKm, 0)} km · gasto $${money(metrics.cashPerKm || 0)}/km`);
+                if (metrics.totalHours > 0) lines.push(`Horas: ${money(metrics.totalHours, 1)} h · $${money(metrics.pocketPerHour || 0)}/h de bolsillo`);
                 const text = lines.join('\n');
 
                 const fallback = () => {
@@ -3597,6 +4039,31 @@
                     done(fallback());
                 }
             }, [metrics, year, monthIndex, totalDays, notify]);
+
+            const exportCard = useCallback(() => {
+                try {
+                    const generatedAt = new Date().toLocaleDateString('es-MX',
+                        { day: '2-digit', month: 'long', year: 'numeric' });
+                    const canvas = renderPerformanceCard(metrics, monthLabel(year, monthIndex), generatedAt);
+                    if (!canvas) { notify('Este navegador no permite generar la ficha', 'warn'); return; }
+                    canvas.toBlob((blob) => {
+                        if (!blob) { notify('No se pudo generar la imagen', 'warn'); return; }
+                        const url = URL.createObjectURL(blob);
+                        const link = document.createElement('a');
+                        link.href = url;
+                        link.download = `didi-ficha-${monthId(year, monthIndex)}.png`;
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                        setTimeout(() => URL.revokeObjectURL(url), 1500);
+                        feedback.confirm();
+                        notify('Ficha de rendimiento descargada');
+                    }, 'image/png');
+                } catch (err) {
+                    notify('No se pudo generar la ficha', 'warn');
+                }
+                setToolsOpen(false);
+            }, [metrics, year, monthIndex, notify]);
 
             const clearMonth = useCallback(() => {
                 setMonth(prev => ({ ...prev, list: buildMonth(prev.year, prev.monthIndex, meta.defaultGoals)
@@ -3699,27 +4166,27 @@
                             <div className="flex items-start justify-between gap-3">
                                 <div className="min-w-0">
                                     <p className="text-[10px] uppercase tracking-[0.14em] text-slate-300 font-bold mb-1">
-                                        Utilidad neta real
+                                        Ganancia real de bolsillo
                                     </p>
                                     <p className={`text-3xl font-bold num tracking-tight ${
-                                        metrics.netProfit >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>
-                                        <AnimatedCash value={metrics.netProfit} />
+                                        metrics.pocketProfit >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>
+                                        <AnimatedCash value={metrics.pocketProfit} />
                                     </p>
                                     <p className="text-[11px] text-slate-500 num mt-1">
-                                        Bruto <AnimatedCash value={metrics.totalEarned} decimals={0} /> − costo operativo{' '}
-                                        <AnimatedCash value={metrics.totalOpCost} decimals={0} />
+                                        Depositado <AnimatedCash value={metrics.totalEarned} decimals={0} /> − salidas{' '}
+                                        <AnimatedCash value={metrics.totalCashOut} decimals={0} /> en efectivo
                                     </p>
                                 </div>
                                 <div className="text-right shrink-0">
                                     <span className={`inline-flex items-center gap-1 text-[11px] font-bold px-2 py-1 rounded-full border ${
-                                        metrics.margin >= 60 ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
-                                        : metrics.margin >= 40 ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                                        metrics.returnRate >= 60 ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+                                        : metrics.returnRate >= 40 ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
                                         : metrics.totalEarned > 0 ? 'bg-rose-500/10 text-rose-300 border-rose-500/30'
                                         : 'bg-slate-800 text-slate-400 border-slate-700'}`}>
                                         <IconGauge size={13} />
-                                        <span className="num">{pctText(metrics.margin, 1)}</span>
+                                        <span className="num">{pctText(metrics.returnRate, 1)}</span>
                                     </span>
-                                    <p className="text-[9px] uppercase tracking-wider text-slate-600 font-bold mt-1">margen real</p>
+                                    <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold mt-1">retorno efectivo</p>
                                 </div>
                             </div>
 
@@ -3736,7 +4203,7 @@
                                         {metrics.equilibrium.label}
                                     </span>
                                     <span className="block text-[10px] text-slate-500 num truncate">
-                                        Punto de equilibrio del mes {cash(metrics.totalOpCost, 0)}
+                                        Equilibrio del mes {cash(metrics.totalCashOut, 0)} en efectivo
                                         {metrics.deficitDays > 0 ? ` · ${metrics.deficitDays} ${metrics.deficitDays === 1 ? 'jornada' : 'jornadas'} bajo costo` : ''}
                                     </span>
                                 </span>
@@ -3750,20 +4217,21 @@
                             </div>
 
                             <div className="grid grid-cols-3 gap-2 mt-3">
-                                <CostChip label="Gasolina" value={cash(metrics.totalGas, 0)} color="text-rose-400" pct={metrics.fuelRatio} />
-                                <CostChip label="Desgaste" value={cash(metrics.totalWear, 0)} color="text-amber-400"
-                                          pct={metrics.totalEarned > 0 ? (metrics.totalWear / metrics.totalEarned) * 100 : 0} />
-                                <CostChip label="Extras" value={cash(metrics.totalExtras, 0)} color="text-violet-400"
-                                          pct={metrics.totalEarned > 0 ? (metrics.totalExtras / metrics.totalEarned) * 100 : 0} />
+                                <CostChip label="Gasolina" value={cash(metrics.totalGas, 0)} color="text-rose-300"
+                                          pct={metrics.fuelRetention} />
+                                <CostChip label="Ruta en efectivo" value={cash(metrics.totalRouteCash, 0)} color="text-amber-300"
+                                          pct={metrics.routeRatio} />
+                                <CostChip label="Queda en cartera" value={cash(metrics.pocketProfit, 0)} color="text-emerald-400"
+                                          pct={metrics.returnRate} />
                             </div>
 
                             <div className="space-y-3 mt-4 pt-4 border-t border-slate-800">
                                 <MeterRow label="Progreso sobre meta mensual" value={metrics.goalProgress}
                                           display={`${pctText(metrics.goalProgress, 1)} · ${cash(metrics.totalEarned, 0)} / ${cash(metrics.totalGoal, 0)}`}
                                           color="bg-emerald-500" />
-                                <MeterRow label="Ratio de combustible" value={metrics.fuelRatio}
-                                          display={`${pctText(metrics.fuelRatio, 1)} del bruto`}
-                                          color={metrics.fuelRatio <= 25 ? 'bg-sky-500' : metrics.fuelRatio <= 40 ? 'bg-amber-500' : 'bg-rose-500'} />
+                                <MeterRow label="Retención de combustible" value={metrics.fuelRetention}
+                                          display={`${pctText(metrics.fuelRetention, 1)} del depósito`}
+                                          color={metrics.fuelRetention <= 25 ? 'bg-sky-500' : metrics.fuelRetention <= 40 ? 'bg-amber-500' : 'bg-rose-500'} />
                                 <MeterRow label="Efectividad de jornadas" value={metrics.effectiveness}
                                           display={`${metrics.achievedDays} de ${metrics.workedDays} · ${pctText(metrics.effectiveness, 0)}`}
                                           color="bg-violet-500" />
@@ -3776,11 +4244,17 @@
                             <div className="flex items-center justify-between gap-3">
                                 <div className="min-w-0">
                                     <p className="text-[10px] uppercase tracking-[0.14em] text-slate-300 font-bold">
-                                        {metrics.goalGap > 0 ? 'Cuota diaria requerida' : 'Meta mensual superada'}
+                                        {metrics.goalGap > 0
+                                            ? (meta.pacingMode === 'record' ? 'Cuota diaria del modo récord' : 'Cuota diaria con alivio')
+                                            : 'Meta mensual superada'}
                                     </p>
                                     <p className={`text-2xl font-bold num mt-1 ${
                                         metrics.goalGap > 0 ? 'text-sky-300' : 'text-emerald-400'} ${stealth ? 'stealth-blur' : ''}`}>
-                                        {metrics.goalGap > 0 ? cash(metrics.requiredDaily, 0) : `+${cash(Math.abs(metrics.goalGap), 0)}`}
+                                        {metrics.goalGap > 0
+                                            ? cash(meta.pacingMode === 'record'
+                                                ? metrics.rebalance.originalDaily
+                                                : metrics.rebalance.reliefDaily, 0)
+                                            : `+${cash(Math.abs(metrics.goalGap), 0)}`}
                                     </p>
                                     <p className="text-[11px] text-slate-500 num mt-0.5">
                                         {metrics.goalGap > 0
@@ -3821,31 +4295,40 @@
                         <section className="grid grid-cols-2 gap-2">
                             <MetricTile icon={<IconTarget size={13} />} label="Meta mensual" masked={stealth}
                                         value={cash(metrics.totalGoal, 0)} sub={`${metrics.goalDays} días con meta`} />
-                            <MetricTile icon={<IconWallet size={13} />} label="Ingreso bruto" tone="positive" masked={stealth}
-                                        value={cash(metrics.totalEarned)} sub={`Prom. ${cash(metrics.avgGross, 0)} / jornada`} />
+                            <MetricTile icon={<IconCheck size={13} />} label="Descansos ganados" masked={stealth}
+                                        tone={metrics.rebalance.earnedRest > 0 ? 'positive' : 'neutral'}
+                                        value={`${metrics.rebalance.earnedRest}`}
+                                        sub={metrics.rebalance.ahead
+                                            ? `Excedente ${cash(metrics.rebalance.surplusNow, 0)}`
+                                            : 'Sin excedente aún'} />
+                            <MetricTile icon={<IconWallet size={13} />} label="Depositado" tone="positive" masked={stealth}
+                                        value={cash(metrics.totalEarned)} sub={`Prom. ${cash(metrics.avgEarned, 0)} / jornada`} />
                             <MetricTile icon={<IconFuel size={13} />} label="Gasolina" tone="negative" masked={stealth}
-                                        value={cash(metrics.totalGas)} sub={`${pctText(metrics.fuelRatio, 1)} del bruto`} />
-                            <MetricTile icon={<IconWrench size={13} />} label="Costo vehicular" tone="warning" masked={stealth}
-                                        value={cash(metrics.totalWear + metrics.totalExtras)}
-                                        sub={`${pctText(metrics.vehicleRatio, 1)} del bruto`} />
-                            <MetricTile icon={<IconTrend size={13} />} label="Proyección bruta" tone="info" masked={stealth}
-                                        value={cash(metrics.projectedGross, 0)} sub={`Run-rate a ${totalDays} días`} />
-                            <MetricTile icon={<IconTrend size={13} />} label="Proyección neta" tone="info" masked={stealth}
-                                        value={cash(metrics.projectedNet, 0)} sub={`Base: ${metrics.workedDays} jornadas`} />
-                            <MetricTile icon={<IconClock size={13} />} label="Neto por hora" masked={stealth}
-                                        tone={metrics.netPerHour !== null && metrics.netPerHour > 0 ? 'positive' : 'neutral'}
-                                        value={metrics.netPerHour !== null ? cash(metrics.netPerHour) : '—'}
+                                        value={cash(metrics.totalGas)} sub={`${pctText(metrics.fuelRetention, 1)} del depósito`} />
+                            <MetricTile icon={<IconRoute size={13} />} label="Gastos de ruta" tone="warning" masked={stealth}
+                                        value={cash(metrics.totalRouteCash)}
+                                        sub={`Casetas, lavado y varios`} />
+                            <MetricTile icon={<IconTrend size={13} />} label="Proyección por perfil" tone="info" masked={stealth}
+                                        value={cash(metrics.projection.projected, 0)}
+                                        sub={`${metrics.projection.fromHistory} días con historia`} />
+                            <MetricTile icon={<IconTrend size={13} />} label="Bolsillo proyectado" tone="info" masked={stealth}
+                                        value={cash(metrics.projection.projectedPocket, 0)}
+                                        sub={`Retorno ${pctText(metrics.returnRate, 0)}`} />
+                            <MetricTile icon={<IconClock size={13} />} label="Bolsillo por hora" masked={stealth}
+                                        tone={metrics.pocketPerHour !== null && metrics.pocketPerHour > 0 ? 'positive' : 'neutral'}
+                                        value={metrics.pocketPerHour !== null ? cash(metrics.pocketPerHour) : '—'}
                                         sub={metrics.totalHours > 0 ? `${money(metrics.totalHours, 1)} h al volante` : 'Captura horas en el detalle'} />
-                            <MetricTile icon={<IconRoute size={13} />} label="Costo por km" masked={stealth}
-                                        value={metrics.costPerKm !== null ? cash(metrics.costPerKm) : '—'}
+                            <MetricTile icon={<IconRoute size={13} />} label="Gasto por km" masked={stealth}
+                                        value={metrics.cashPerKm !== null ? cash(metrics.cashPerKm) : '—'}
                                         sub={metrics.totalKm > 0 ? `${money(metrics.totalKm, 0)} km recorridos` : 'Captura km en el detalle'} />
                         </section>
 
+                        <PacingStrategyPanel metrics={metrics}
+                                             mode={meta.pacingMode === 'record' ? 'record' : 'relief'}
+                                             onMode={setPacingMode} />
+
                         <PredictivePanel prediction={prediction} metrics={deferredMetrics}
                                          samples={grossSamples} targetDaily={targetDaily} />
-
-                        <SinkingFundsPanel funds={metrics.funds} netProfit={metrics.netProfit}
-                                           grossIncome={metrics.totalEarned} />
 
                         <WhatIfPanel metrics={deferredMetrics} />
 
@@ -3911,6 +4394,7 @@
                         onImportFile={importFile}
                         onExportCsv={exportCsv}
                         onCopySummary={copySummary}
+                        onExportCard={exportCard}
                         onClearMonth={clearMonth}
                         soundOn={meta.sound !== false}
                         onToggleSound={() => {
@@ -3972,7 +4456,7 @@
             <div className="bg-slate-800/40 border border-slate-800 rounded-lg px-2 py-1.5">
                 <p className="text-[9px] uppercase tracking-wider text-slate-300 font-bold truncate">{label}</p>
                 <p className={`text-[13px] font-bold num ${color}`}>{value}</p>
-                <p className="text-[9px] text-slate-400 num">{pctText(pct, 1)} del bruto</p>
+                <p className="text-[9px] text-slate-400 num">{pctText(pct, 1)} del depósito</p>
             </div>
         );
 
