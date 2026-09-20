@@ -1,6 +1,6 @@
 # Telemetría DiDi Pro
 
-Cockpit operativo de flujo de caja real para conductor de plataforma.
+Sistema de contabilidad analítica y contraloría de caja para conductor de plataforma.
 Un único archivo autónomo (`index.html`) que corre en cualquier navegador móvil, sin build ni servidor,
 e instalable como app gracias a un manifest PWA embebido.
 
@@ -14,7 +14,7 @@ así que funciona igual servido por `file://` o por un servidor local.
 
 | Clave | Contenido |
 | --- | --- |
-| `didi_telemetry_meta` | Mes activo, metas por defecto, ticket y meta por hora, estrategia de cuota, modo sigilo |
+| `didi_telemetry_meta` | Mes activo, metas por defecto, ticket y meta por hora, estrategia de cuota, base contable, conciliaciones bancarias, modo sigilo |
 | `didi_data_YYYY_MM` | Un registro por mes (ej. `didi_data_2026_09`) |
 | `didi-tracker-app` | Clave original: se migra a `didi_data_2026_09` y se mantiene sincronizada |
 
@@ -22,27 +22,94 @@ así que funciona igual servido por `file://` o por un servidor local.
   Septiembre 2026, se copia sin alterar un solo peso. La clave original nunca se borra y sigue
   recibiendo los cambios de ese mes, así que la versión anterior del archivo la sigue abriendo.
 - **Campos por día:** `id`, `dateString`, `dayName`, `goal`, `earned`, `gas` (esquema original, intacto)
-  más los opcionales `hours`, `km`, `tolls`, `wash`, `misc`.
+  más los opcionales `hours`, `km`, `tolls`, `wash`, `misc`, `cashCollected` y `appDeposit`.
 - **Calendario real:** los días de cada mes y su día de la semana se calculan con `new Date`,
   incluyendo años bisiestos (Febrero 2028 rinde 29 tarjetas).
 
-## Modelo financiero: caja real de bolsillo
+## Contabilidad: estado de resultados en cascada
 
-`earned` es el **depósito neto** que la plataforma ya transfirió: comisiones, ISR e IVA quedaron
-retenidos en origen. La app nunca vuelve a descontarle nada que no haya salido de la cartera,
-y no modela amortizaciones ni provisiones teóricas.
+`earned` es el **ingreso líquido reconocido**: lo que la plataforma ya depositó, con comisiones
+e impuestos retenidos en origen. No hay provisiones de ISR/IVA, depreciaciones ni amortizaciones
+teóricas — toda la contabilidad se rige por flujo de caja y margen de contribución real.
 
 ```
-Ganancia real de bolsillo = depositado − gasolina − casetas − lavado − varios
-Retención de combustible  = gasolina / depositado × 100
-Tasa de retorno efectiva  = bolsillo / depositado × 100
+  Ingresos operativos netos          Σ earned
+− Combustible                        Σ gas
+− Peajes y casetas                   Σ tolls
+═ Margen de contribución             ratio = margen / earned
+− Lavado y acondicionamiento         Σ wash
+− Misceláneos de ruta                Σ misc
+═ Utilidad neta operativa de caja    margen operativo = utilidad / earned
 ```
 
-| Métrica | Cálculo |
+### Base caja vs. base devengada
+
+Llenar el tanque un martes deja ese día con margen negativo y el miércoles con margen inflado.
+El conmutador de base contable corrige la distorsión:
+
+- **Flujo de caja:** el gasto cae el día en que se pagó (realidad de billetera).
+- **Devengado:** el combustible se imputa por consumo, `km del día × (Σgas / Σkm)`. Como el costo
+  medio ponderado sale de ese mismo total, la bolsa del mes no cambia: solo se redistribuye.
+
+### Ratios de eficiencia
+
+| Ratio | Cálculo |
 | --- | --- |
-| Punto de equilibrio diario | Depósito mínimo para cubrir el efectivo del turno (`gasolina + gastos de ruta`) |
-| Cuota diaria requerida | Brecha de meta repartida entre las jornadas pendientes |
-| Por jornada | `$/hr` de bolsillo, `$/km` de gasolina y gasto total por km |
+| Absorción de combustible | `Σgas / Σearned × 100` |
+| Costo por hora de servicio | `costos totales / Σhours` |
+| Retención marginal | Proporción de cada peso extra que queda íntegra en caja |
+| Apalancamiento operativo | `margen de contribución / utilidad de caja` |
+| Margen de seguridad | `margen de contribución / earned` — saludable ≥65%, precaución 40–65%, crítico <40% |
+
+## Arqueo de tesorería dual
+
+Cada jornada admite el desglose opcional de `cashCollected` (efectivo cobrado a bordo) y
+`appDeposit` (saldo liquidado por la billetera). Si no se desglosa, `earned` sigue siendo el
+ingreso consolidado. Con el desglose, la app vigila el efectivo físico:
+
+```
+Efectivo líquido en mano = cashCollected − (gas + tolls + misc)
+```
+
+y avisa cuando el operador financió la ruta de su propio bolsillo. Si el desglose no suma lo
+capturado en `earned`, la tarjeta señala la diferencia.
+
+## Conciliación semanal de cortes
+
+Las jornadas se agrupan en semanas calendario (lunes a domingo). Cada corte muestra facturado,
+egresos, margen y su ratio, admite el **depósito real del banco** para contrastarlo contra los
+registros y se marca como conciliado. Los descuadres bajo $1 se etiquetan como ajuste de centavos
+de la plataforma. El estado se persiste por mes en `didi_telemetry_meta`.
+
+## Análisis de variaciones presupuestarias
+
+```
+Δ Total       = ingreso real − meta presupuestada
+Δ Volumen     = (días trabajados − días programados) × meta diaria media
+Δ Rendimiento = Σ (earned − goal) sobre los días efectivamente trabajados
+Δ Residual    = presupuesto de días programados que aún no se registran
+```
+
+El panel reparte el déficit o el excedente entre las tres causas y emite el diagnóstico en
+lenguaje llano ("el 85% del déficit se explica por los días no trabajados").
+
+## Auditoría de asientos
+
+Un inspector recorre el mes y levanta banderas navegables — al tocarlas, la app enfoca el día:
+
+- **Asiento incompleto:** horas o km capturados sin ingreso.
+- **Costo huérfano:** gasolina o peajes sin actividad operativa.
+- **Margen negativo:** los costos directos superaron lo depositado.
+- **Margen inverosímil:** más de 95% de margen con kilometraje alto (falta registrar combustible).
+
+## Cédula de liquidación y libro diario
+
+- **Cédula de cierre de periodo:** cuadro monoespaciado alineado al portapapeles, con ingreso,
+  costos variables, margen y ratio, OPEX, utilidad de caja e indicadores por km y por hora.
+- **Libro diario en partida doble:** cada jornada genera un asiento de ingreso (cargo a Bancos o
+  Caja, abono a Ingresos operativos) y uno de costos (cargo al gasto, abono a Caja), con
+  verificación de sumas iguales y exportación CSV `Fecha, Asiento_ID, Cuenta_Contable, Concepto,
+  Debe, Haber, Saldo_Neto_Acumulado` con BOM UTF-8.
 
 ## Proyección estratificada por perfil de día
 

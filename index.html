@@ -112,7 +112,8 @@
         };
 
         /* Campos monetarios/numéricos editables de cada jornada */
-        const NUMERIC_FIELDS = ['goal', 'earned', 'gas', 'hours', 'km', 'tolls', 'wash', 'misc'];
+        const NUMERIC_FIELDS = ['goal', 'earned', 'gas', 'hours', 'km', 'tolls', 'wash', 'misc',
+                                'cashCollected', 'appDeposit'];
 
         const COLORS = {
             emerald: '#10b981',
@@ -300,6 +301,10 @@
                 sound: base.sound !== false,          // realimentación sonora activa por defecto
                 defaultGoals: mergedGoals,
                 pacingMode: base.pacingMode === 'record' ? 'record' : 'relief',
+                /* Base contable de la vista: caja pura o consumo devengado */
+                accountingBasis: base.accountingBasis === 'accrual' ? 'accrual' : 'cash',
+                /* Conciliaciones bancarias por semana: { '2026-09': { 1: {bank, reconciled} } } */
+                settlements: base.settlements && typeof base.settlements === 'object' ? base.settlements : {},
                 costs: {
                     avgTicket: Number(costs.avgTicket) > 0 ? Number(costs.avgTicket) : DEFAULT_COSTS.avgTicket,
                     targetHourly: Number(costs.targetHourly) > 0
@@ -331,7 +336,9 @@
                     km: '',
                     tolls: '',
                     wash: '',
-                    misc: ''
+                    misc: '',
+                    cashCollected: '',   // efectivo cobrado en mano
+                    appDeposit: ''       // saldo liquidado por la billetera de la app
                 };
             });
         };
@@ -350,7 +357,8 @@
                     id: id,
                     dateString: `${id}`,
                     dayName: '',
-                    goal: 0, earned: '', gas: '', hours: '', km: '', tolls: '', wash: '', misc: ''
+                    goal: 0, earned: '', gas: '', hours: '', km: '', tolls: '', wash: '', misc: '',
+                    cashCollected: '', appDeposit: ''
                 };
                 const merged = { ...template, ...entry, id: id };
                 merged.dateString = entry.dateString || template.dateString;
@@ -456,50 +464,79 @@
            la app solo le resta dinero que salió de la cartera del conductor.
            Salidas = gasolina + casetas + lavado + misceláneos de ruta
            Bolsillo real   = depositado - gasolina - gastos de ruta                    */
-        const computeDay = (day, costs) => {
+        const computeDay = (day, costs, accrual) => {
             const goal = num(day.goal);
-            const earned = num(day.earned);        // depósito neto recibido de la plataforma
-            const gas = num(day.gas);              // combustible pagado de la cartera
+            const earned = num(day.earned);        // ingreso líquido reconocido (ya depositado)
+            const gasPaid = num(day.gas);          // combustible pagado ese día (base caja)
             const hours = num(day.hours);
             const km = num(day.km);
             const tolls = num(day.tolls);
             const wash = num(day.wash);
             const misc = num(day.misc);
+            const cashCollected = num(day.cashCollected);
+            const appDeposit = num(day.appDeposit);
 
-            /* Gastos de ruta en efectivo: casetas, lavado y misceláneos del turno */
-            const routeCash = tolls + wash + misc;
-            const cashOut = gas + routeCash;
-            const pocket = earned - cashOut;       // ganancia real de bolsillo
+            /* Base devengada: el combustible se imputa por consumo (km del día x costo medio
+               ponderado del mes), no por la fecha en que se llenó el tanque. La suma mensual
+               se conserva intacta porque el costo medio sale de ese mismo total. */
+            const accrualRate = accrual && accrual.mode === 'accrual' ? num(accrual.ratePerKm) : 0;
+            const gasAccrued = accrualRate > 0 ? km * accrualRate : gasPaid;
+            const usesAccrual = accrualRate > 0;
+            const gas = usesAccrual ? gasAccrued : gasPaid;
+
+            /* Cascada del estado de resultados */
+            const directCosts = gas + tolls;               // costos variables de ruta
+            const contributionMargin = earned - directCosts;
+            const opex = wash + misc;                      // gastos auxiliares de cabina
+            const operatingCashFlow = contributionMargin - opex;
+
+            const cashOut = directCosts + opex;
+            const pocket = operatingCashFlow;              // bottom line = flujo de caja libre
+
+            /* Arqueo: efectivo físico que queda tras pagar la ruta de la propia mano */
+            const declaredSplit = cashCollected > 0 || appDeposit > 0;
+            const cashOnHand = cashCollected - (gasPaid + tolls + misc);
+            const splitDelta = declaredSplit ? (cashCollected + appDeposit) - earned : 0;
 
             const targetHourly = num(costs.targetHourly) > 0 ? num(costs.targetHourly) : DEFAULT_COSTS.targetHourly;
             const realHourly = hours > 0 ? earned / hours : null;
             const requiredHourly = hours > 0 && goal > 0 ? goal / hours : null;
             const remainingToGoal = Math.max(goal - earned, 0);
-            /* Tiempo restante estimado al ritmo real de facturación */
             const hoursToGoal = realHourly !== null && realHourly > 0 && remainingToGoal > 0
                 ? remainingToGoal / realHourly
                 : null;
 
+            const safetyRatio = earned > 0 ? (contributionMargin / earned) * 100 : 0;
+            const safetyBand = earned <= 0 ? 'idle'
+                : safetyRatio >= 65 ? 'healthy'
+                : safetyRatio >= 40 ? 'caution'
+                : 'critical';
+
             return {
-                goal, earned, gas, hours, km, tolls, wash, misc,
-                routeCash, cashOut, pocket,
-                hasData: earned > 0 || gas > 0 || routeCash > 0 || km > 0 || hours > 0,
-                /* Punto de equilibrio: depósito mínimo para cubrir el efectivo del turno */
+                goal, earned, hours, km, tolls, wash, misc,
+                gasPaid, gasAccrued, gas, usesAccrual,
+                cashCollected, appDeposit, declaredSplit, cashOnHand, splitDelta,
+                directCosts, contributionMargin, opex, operatingCashFlow,
+                routeCash: tolls + wash + misc,
+                cashOut, pocket,
+                hasData: earned > 0 || gasPaid > 0 || tolls + wash + misc > 0 || km > 0 || hours > 0,
                 breakEven: cashOut,
                 breakEvenGap: cashOut - earned,
                 coverage: cashOut > 0 ? Math.min((earned / cashOut) * 100, 999) : (earned > 0 ? 100 : 0),
                 percentage: getPercentage(earned, goal),
                 status: getDayStatus(day),
-                /* Tasa de retorno efectiva: cuánto del depósito llega a la cartera */
-                returnRate: earned > 0 ? (pocket / earned) * 100 : 0,
-                /* Retención de combustible: cuánto se quedó en la gasolinera */
+                returnRate: earned > 0 ? (operatingCashFlow / earned) * 100 : 0,
+                contributionRatio: earned > 0 ? (contributionMargin / earned) * 100 : 0,
                 fuelRetention: earned > 0 ? (gas / earned) * 100 : 0,
-                routeRatio: earned > 0 ? (routeCash / earned) * 100 : 0,
+                routeRatio: earned > 0 ? ((tolls + wash + misc) / earned) * 100 : 0,
+                safetyRatio, safetyBand,
                 realHourly, requiredHourly, hoursToGoal, targetHourly,
-                pocketPerHour: hours > 0 ? pocket / hours : null,
+                pocketPerHour: hours > 0 ? operatingCashFlow / hours : null,
+                costPerServiceHour: hours > 0 ? cashOut / hours : null,
                 gasPerKm: km > 0 && gas > 0 ? gas / km : null,
                 cashPerKm: km > 0 ? cashOut / km : null,
-                pocketPerKm: km > 0 ? pocket / km : null
+                pocketPerKm: km > 0 ? operatingCashFlow / km : null,
+                varianceVsGoal: earned > 0 ? earned - goal : 0
             };
         };
 
@@ -526,11 +563,22 @@
         };
 
         /* Consolidado mensual: finanzas, pacing, proyecciones, estadística y series */
-        const computeMonthMetrics = (days, costs, totalDaysInMonth) => {
-            let totalGoal = 0, totalEarned = 0, totalGas = 0, totalRouteCash = 0;
+        const computeMonthMetrics = (days, costs, totalDaysInMonth, basis) => {
+            /* Pre-pase: el costo medio ponderado de combustible por kilómetro sale del
+               total del mes, así que la vista devengada reparte exactamente la misma bolsa. */
+            let sumGas = 0, sumKm = 0;
+            days.forEach(day => { sumGas += num(day.gas); sumKm += num(day.km); });
+            const weightedGasPerKm = sumKm > 0 ? sumGas / sumKm : 0;
+            const accrual = { mode: basis === 'accrual' ? 'accrual' : 'cash', ratePerKm: weightedGasPerKm };
+            const accrualActive = accrual.mode === 'accrual' && weightedGasPerKm > 0;
+
+            let totalGoal = 0, totalEarned = 0, totalGas = 0, totalGasPaid = 0;
             let totalTolls = 0, totalWash = 0, totalMisc = 0;
-            let totalCashOut = 0, totalKm = 0, totalHours = 0;
+            let totalDirectCosts = 0, totalOpex = 0, totalCashOut = 0;
+            let totalKm = 0, totalHours = 0;
+            let totalCashCollected = 0, totalAppDeposit = 0, totalCashOnHand = 0;
             let workedDays = 0, achievedDays = 0, goalDays = 0, pendingDays = 0, emptyDays = 0;
+            let scheduledGoalSum = 0;
             let bestDay = null;
 
             const pocketSeries = [];
@@ -543,31 +591,38 @@
             const cumulativePocket = [];
             const dailyPocket = [];
             const gasPerKmSamples = [];
+            const auditFlags = [];
             let accGoal = 0, accEarned = 0, accGas = 0, accPocket = 0, lastWorkedIndex = -1;
+            let performanceVariance = 0;
 
             const computed = days.map((day, index) => {
-                const c = computeDay(day, costs);
+                const c = computeDay(day, costs, accrual);
 
                 totalGoal += c.goal;
                 totalEarned += c.earned;
                 totalGas += c.gas;
-                totalRouteCash += c.routeCash;
+                totalGasPaid += c.gasPaid;
                 totalTolls += c.tolls;
                 totalWash += c.wash;
                 totalMisc += c.misc;
+                totalDirectCosts += c.directCosts;
+                totalOpex += c.opex;
                 totalCashOut += c.cashOut;
                 totalKm += c.km;
                 totalHours += c.hours;
+                totalCashCollected += c.cashCollected;
+                totalAppDeposit += c.appDeposit;
+                if (c.cashCollected > 0) totalCashOnHand += c.cashOnHand;
 
                 accGoal += c.goal;
                 accEarned += c.earned;
                 accGas += c.gas;
-                accPocket += c.pocket;
+                accPocket += c.operatingCashFlow;
                 cumulativeGoal.push(accGoal);
                 cumulativeEarned.push(accEarned);
                 cumulativeGas.push(accGas);
                 cumulativePocket.push(accPocket);
-                dailyPocket.push(c.pocket);
+                dailyPocket.push(c.operatingCashFlow);
 
                 if (c.goal > 0) goalDays += 1;
                 if (c.status === 'pendiente') pendingDays += 1;
@@ -576,29 +631,63 @@
                 if (c.earned > 0) {
                     workedDays += 1;
                     lastWorkedIndex = index;
-                    pocketSeries.push(c.pocket);
+                    scheduledGoalSum += c.goal;
+                    performanceVariance += c.earned - c.goal;
+                    pocketSeries.push(c.operatingCashFlow);
                     if (c.status === 'cumplido') achievedDays += 1;
-                    if (!bestDay || c.pocket > bestDay.pocket) {
-                        bestDay = { pocket: c.pocket, earned: c.earned, label: day.dateString, id: day.id };
+                    if (!bestDay || c.operatingCashFlow > bestDay.pocket) {
+                        bestDay = { pocket: c.operatingCashFlow, earned: c.earned, label: day.dateString, id: day.id };
                     }
                     const wd = DAYS_OF_WEEK.indexOf(day.dayName);
                     const bucket = wd >= 0 ? weekdayAcc[wd] : null;
                     if (bucket) {
                         bucket.earned += c.earned;
-                        bucket.pocket += c.pocket;
+                        bucket.pocket += c.operatingCashFlow;
                         bucket.count += 1;
                     }
                 }
                 if (c.gasPerKm !== null) gasPerKmSamples.push(c.gasPerKm);
 
+                /* --- Auditoría de asientos --- */
+                if (c.earned <= 0 && (c.hours > 0 || c.km > 0)) {
+                    auditFlags.push({
+                        id: day.id, label: day.dateString, type: 'incompleto',
+                        severity: 'warn', title: 'Asiento incompleto',
+                        detail: `${c.hours > 0 ? `${money(c.hours, 1)} h` : ''}${c.hours > 0 && c.km > 0 ? ' y ' : ''}${c.km > 0 ? `${money(c.km, 0)} km` : ''} sin ingreso capturado`
+                    });
+                }
+                if (c.earned <= 0 && c.km <= 0 && (c.gasPaid > 0 || c.tolls > 0)) {
+                    auditFlags.push({
+                        id: day.id, label: day.dateString, type: 'huerfano',
+                        severity: 'warn', title: 'Costo huérfano',
+                        detail: `${money(c.gasPaid + c.tolls, 2)} de costo sin actividad operativa`
+                    });
+                }
+                if (c.earned > 0 && c.contributionMargin < 0) {
+                    auditFlags.push({
+                        id: day.id, label: day.dateString, type: 'margen',
+                        severity: 'error', title: 'Margen de contribución negativo',
+                        detail: `Los costos directos superaron lo depositado en ${money(Math.abs(c.contributionMargin), 2)}`
+                    });
+                }
+                if (c.earned > 0 && c.km >= 80 && c.contributionRatio > 95) {
+                    auditFlags.push({
+                        id: day.id, label: day.dateString, type: 'anomalia',
+                        severity: 'info', title: 'Margen inverosímil',
+                        detail: `${pctText(c.contributionRatio, 0)} de margen con ${money(c.km, 0)} km: falta registrar combustible`
+                    });
+                }
+
                 return c;
             });
 
-            const pocketProfit = totalEarned - totalCashOut;
+            const contributionMargin = totalEarned - totalDirectCosts;
+            const operatingCashFlow = contributionMargin - totalOpex;
+            const pocketProfit = operatingCashFlow;
             const horizon = totalDaysInMonth || days.length || 1;
 
             const avgEarned = workedDays > 0 ? totalEarned / workedDays : 0;
-            const avgPocket = workedDays > 0 ? pocketProfit / workedDays : 0;
+            const avgPocket = workedDays > 0 ? operatingCashFlow / workedDays : 0;
 
             const goalGap = totalGoal - totalEarned;
             const remainingDays = days.filter(d => num(d.earned) <= 0).length;
@@ -609,11 +698,8 @@
                 ? gasPerKmSamples.reduce((a, b) => a + b, 0) / gasPerKmSamples.length
                 : null;
 
-            /* Perfil de rendimiento por día de la semana: la demanda no es uniforme */
             const weekdayStats = WEEK_ORDER.map(wd => ({
-                weekday: wd,
-                label: DAY_SHORT[wd],
-                name: DAYS_OF_WEEK[wd],
+                weekday: wd, label: DAY_SHORT[wd], name: DAYS_OF_WEEK[wd],
                 count: weekdayAcc[wd].count,
                 avgEarned: weekdayAcc[wd].count > 0 ? weekdayAcc[wd].earned / weekdayAcc[wd].count : 0,
                 avgPocket: weekdayAcc[wd].count > 0 ? weekdayAcc[wd].pocket / weekdayAcc[wd].count : 0
@@ -623,7 +709,6 @@
             const bestWeekday = weekdayStats.reduce(
                 (best, item) => (item.count > 0 && (!best || item.avgPocket > best.avgPocket) ? item : best), null);
 
-            /* Agrupación por tipo de demanda: base (lun-jue) contra fin de semana (vie-dom) */
             const groupOf = (weekday) => (weekday === 5 || weekday === 6 || weekday === 0 ? 'peak' : 'base');
             const clusters = { base: { earned: 0, pocket: 0, count: 0 }, peak: { earned: 0, pocket: 0, count: 0 } };
             WEEK_ORDER.forEach(wd => {
@@ -634,29 +719,90 @@
                 target.count += bucket.count;
             });
             const clusterStats = {
-                base: {
-                    label: 'Demanda base', detail: 'Lun · Mar · Mié · Jue',
-                    count: clusters.base.count,
-                    avgEarned: clusters.base.count > 0 ? clusters.base.earned / clusters.base.count : 0,
-                    avgPocket: clusters.base.count > 0 ? clusters.base.pocket / clusters.base.count : 0
-                },
-                peak: {
-                    label: 'Alta demanda', detail: 'Vie · Sáb · Dom',
-                    count: clusters.peak.count,
-                    avgEarned: clusters.peak.count > 0 ? clusters.peak.earned / clusters.peak.count : 0,
-                    avgPocket: clusters.peak.count > 0 ? clusters.peak.pocket / clusters.peak.count : 0
-                }
+                base: { label: 'Demanda base', detail: 'Lun · Mar · Mié · Jue', count: clusters.base.count,
+                        avgEarned: clusters.base.count > 0 ? clusters.base.earned / clusters.base.count : 0,
+                        avgPocket: clusters.base.count > 0 ? clusters.base.pocket / clusters.base.count : 0 },
+                peak: { label: 'Alta demanda', detail: 'Vie · Sáb · Dom', count: clusters.peak.count,
+                        avgEarned: clusters.peak.count > 0 ? clusters.peak.earned / clusters.peak.count : 0,
+                        avgPocket: clusters.peak.count > 0 ? clusters.peak.pocket / clusters.peak.count : 0 }
             };
 
+            /* --- Análisis de variaciones presupuestarias --- */
+            const avgDailyGoal = goalDays > 0 ? totalGoal / goalDays : 0;
+            const volumeVariance = (workedDays - goalDays) * avgDailyGoal;
+            const totalVariance = totalEarned - totalGoal;
+            /* El residuo recoge los días programados que aún no se trabajan */
+            const residualVariance = totalVariance - volumeVariance - performanceVariance;
+            const absSum = Math.abs(volumeVariance) + Math.abs(performanceVariance) + Math.abs(residualVariance);
+            const variance = {
+                total: totalVariance, volume: volumeVariance,
+                performance: performanceVariance, residual: residualVariance,
+                avgDailyGoal, workedDays, goalDays,
+                volumeShare: absSum > 0 ? (Math.abs(volumeVariance) / absSum) * 100 : 0,
+                performanceShare: absSum > 0 ? (Math.abs(performanceVariance) / absSum) * 100 : 0,
+                residualShare: absSum > 0 ? (Math.abs(residualVariance) / absSum) * 100 : 0
+            };
+
+            /* --- Semanas contables (lunes a domingo) --- */
+            const weeks = [];
+            let current = null;
+            days.forEach((day, index) => {
+                const c = computed[index];
+                const weekday = DAYS_OF_WEEK.indexOf(day.dayName);
+                const isMonday = weekday === 1;
+                if (!current || isMonday) {
+                    current = {
+                        index: weeks.length + 1, from: day.dateString, to: day.dateString,
+                        fromId: day.id, toId: day.id, dayIds: [],
+                        earned: 0, gas: 0, tolls: 0, misc: 0, wash: 0, direct: 0, opex: 0,
+                        pocket: 0, worked: 0, goal: 0
+                    };
+                    weeks.push(current);
+                }
+                current.to = day.dateString;
+                current.toId = day.id;
+                current.dayIds.push(day.id);
+                current.earned += c.earned;
+                current.gas += c.gasPaid;
+                current.tolls += c.tolls;
+                current.misc += c.misc;
+                current.wash += c.wash;
+                current.direct += c.gasPaid + c.tolls;
+                current.opex += c.wash + c.misc;
+                current.pocket += c.earned - (c.gasPaid + c.tolls + c.wash + c.misc);
+                current.goal += c.goal;
+                if (c.earned > 0) current.worked += 1;
+            });
+            weeks.forEach(week => {
+                week.egress = week.direct + week.opex;
+                week.margin = week.earned - week.egress;
+                week.marginRatio = week.earned > 0 ? (week.margin / week.earned) * 100 : 0;
+            });
+
+            const fuelAbsorption = totalEarned > 0 ? (totalGas / totalEarned) * 100 : 0;
+            const costPerServiceHour = totalHours > 0 ? totalCashOut / totalHours : null;
+            /* Apalancamiento operativo: qué parte de cada peso sobre la meta llega íntegro a caja */
+            const aboveGoal = Math.max(totalEarned - totalGoal, 0);
+            const operatingLeverage = contributionMargin !== 0 && operatingCashFlow !== 0
+                ? contributionMargin / operatingCashFlow
+                : null;
+            const marginalRetention = totalEarned > 0 ? (contributionMargin / totalEarned) : 0;
+
             return {
-                computed,
-                totalGoal, totalEarned, totalGas, totalRouteCash, totalCashOut,
+                computed, accrualActive, weightedGasPerKm, basis: accrual.mode,
+                totalGoal, totalEarned, totalGas, totalGasPaid,
                 totalTolls, totalWash, totalMisc,
-                totalKm, totalHours, pocketProfit,
-                /* Tasa de retorno efectiva y retención de combustible del mes */
-                returnRate: totalEarned > 0 ? (pocketProfit / totalEarned) * 100 : 0,
-                fuelRetention: totalEarned > 0 ? (totalGas / totalEarned) * 100 : 0,
-                routeRatio: totalEarned > 0 ? (totalRouteCash / totalEarned) * 100 : 0,
+                totalDirectCosts, totalOpex, totalCashOut, totalRouteCash: totalTolls + totalWash + totalMisc,
+                totalKm, totalHours,
+                totalCashCollected, totalAppDeposit, totalCashOnHand,
+                contributionMargin, operatingCashFlow, pocketProfit,
+                contributionRatio: totalEarned > 0 ? (contributionMargin / totalEarned) * 100 : 0,
+                returnRate: totalEarned > 0 ? (operatingCashFlow / totalEarned) * 100 : 0,
+                fuelRetention: fuelAbsorption, fuelAbsorption,
+                routeRatio: totalEarned > 0 ? ((totalTolls + totalWash + totalMisc) / totalEarned) * 100 : 0,
+                opexRatio: totalEarned > 0 ? (totalOpex / totalEarned) * 100 : 0,
+                costPerServiceHour, operatingLeverage, marginalRetention, aboveGoal,
+                safetyRatio: totalEarned > 0 ? (contributionMargin / totalEarned) * 100 : 0,
                 goalProgress: totalGoal > 0 ? (totalEarned / totalGoal) * 100 : 0,
                 workedDays, achievedDays, goalDays, pendingDays, emptyDays,
                 effectiveness: workedDays > 0 ? (achievedDays / workedDays) * 100 : 0,
@@ -668,10 +814,9 @@
                 cumulativeGoal, cumulativeEarned, cumulativeGas, cumulativePocket,
                 dailyPocket, lastWorkedIndex,
                 earnedPerHour: totalHours > 0 ? totalEarned / totalHours : null,
-                pocketPerHour: totalHours > 0 ? pocketProfit / totalHours : null,
+                pocketPerHour: totalHours > 0 ? operatingCashFlow / totalHours : null,
                 cashPerKm: totalKm > 0 ? totalCashOut / totalKm : null,
-                avgGasPerKm,
-                spc
+                avgGasPerKm, spc, variance, weeks, auditFlags
             };
         };
 
@@ -858,15 +1003,15 @@
             () => breakEvenState(num(earned), num(cost)), [earned, cost]);
 
         /* Telemetría financiera consolidada del mes visible */
-        const useFinancialTelemetry = (days, costs, elapsedDays) => useMemo(() => {
-            const base = computeMonthMetrics(days, costs, days.length);
+        const useFinancialTelemetry = (days, costs, elapsedDays, basis) => useMemo(() => {
+            const base = computeMonthMetrics(days, costs, days.length, basis);
             const pacing = computePacing(base.goalProgress, elapsedDays, days.length);
             const equilibrium = breakEvenState(base.totalEarned, base.totalCashOut);
             const deficitDays = base.computed.filter(c => c.earned > 0 && c.breakEvenGap > 0.005).length;
             const projection = projectStratified(days, base);
             const rebalance = rebalanceGoals(days, base, projection);
             return { ...base, pacing, equilibrium, deficitDays, projection, rebalance };
-        }, [days, costs, elapsedDays]);
+        }, [days, costs, elapsedDays, basis]);
 
         /* ============================================================================
            5d. MODELOS PREDICTIVOS Y CONTROL ESTOCÁSTICO
@@ -1962,7 +2107,33 @@
                             <MoneyField id={`gas-${day.id}`} label="Gasolina" tone="gas" value={day.gas} onChange={set('gas')} />
                         </div>
 
+                        {c.usesAccrual && Math.abs(c.gasAccrued - c.gasPaid) > 0.01 && (
+                            <p className="text-[10px] text-sky-300 num mb-2.5">
+                                Devengado: {cash(c.gasAccrued)} por {money(c.km, 0)} km
+                                <span className="text-slate-400"> · pagado {cash(c.gasPaid)}</span>
+                            </p>
+                        )}
+
                         {c.hours > 0 && <ShiftSpeedometer day={day} costs={costs} />}
+
+                        {/* Margen de seguridad de la jornada */}
+                        {c.earned > 0 && (
+                            <div className="flex items-center justify-between gap-2 mb-2.5">
+                                <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">
+                                    Margen de seguridad
+                                </span>
+                                <span className="flex items-center gap-1.5">
+                                    <span className={`text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded border ${
+                                        c.safetyBand === 'healthy' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/40'
+                                        : c.safetyBand === 'caution' ? 'bg-amber-500/10 text-amber-300 border-amber-500/40'
+                                        : 'bg-rose-500/10 text-rose-300 border-rose-500/40'}`}>
+                                        {c.safetyBand === 'healthy' ? 'Saludable'
+                                            : c.safetyBand === 'caution' ? 'Precaución' : 'Crítico'}
+                                    </span>
+                                    <span className="text-[13px] font-bold num text-slate-100">{pctText(c.safetyRatio, 0)}</span>
+                                </span>
+                            </div>
+                        )}
 
                         {/* Punto de equilibrio de la jornada */}
                         {c.hasData && (
@@ -2038,7 +2209,44 @@
                                                 value={day.misc} onChange={set('misc')} />
                                 </div>
 
+                                {/* Arqueo de tesorería: cómo se liquidó el ingreso del turno */}
+                                <div className="grid grid-cols-2 gap-2">
+                                    <MoneyField id={`cash-${day.id}`} label="Efectivo cobrado" tone="earned" compact
+                                                value={day.cashCollected} onChange={set('cashCollected')} />
+                                    <MoneyField id={`app-${day.id}`} label="Saldo en app" tone="unit" compact
+                                                value={day.appDeposit} onChange={set('appDeposit')} />
+                                </div>
+
+                                {c.declaredSplit && (
+                                    <div className={`rounded-lg border px-2.5 py-2 ${
+                                        c.cashOnHand < 0 ? 'bg-rose-950/25 border-rose-900/50'
+                                                         : 'bg-slate-800/40 border-slate-800'}`}>
+                                        <div className="flex items-center justify-between gap-2">
+                                            <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">
+                                                Efectivo líquido en mano
+                                            </span>
+                                            <span className={`text-[13px] font-bold num ${
+                                                c.cashOnHand >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>
+                                                {cash(c.cashOnHand)}
+                                            </span>
+                                        </div>
+                                        <p className="text-[9px] text-slate-400 num mt-0.5">
+                                            {c.cashOnHand < 0
+                                                ? `Pusiste ${cash(Math.abs(c.cashOnHand))} de tu bolsillo para cubrir la ruta`
+                                                : `Cobrado ${cash(c.cashCollected, 0)} − ruta en efectivo ${cash(c.gasPaid + c.tolls + c.misc, 0)}`}
+                                        </p>
+                                        {Math.abs(c.splitDelta) > 0.01 && (
+                                            <p className="text-[9px] text-amber-300 num mt-0.5">
+                                                El desglose difiere {cash(Math.abs(c.splitDelta))} del ingreso capturado.
+                                            </p>
+                                        )}
+                                    </div>
+                                )}
+
                                 <div className="grid grid-cols-2 gap-1.5">
+                                    <DerivedStat label="Margen de contribución" value={cash(c.contributionMargin)}
+                                                 hint={`Ratio ${pctText(c.contributionRatio, 0)}`}
+                                                 tone={c.contributionMargin < 0 ? 'warn' : 'default'} />
                                     <DerivedStat label="Punto de equilibrio" value={cash(c.breakEven)}
                                                  hint={`Cobertura ${pctText(c.coverage, 0)}`}
                                                  tone={equilibrium.key === 'deficit' ? 'warn' : 'default'} />
@@ -2294,7 +2502,7 @@
         function ToolsSheet({
             open, onClose, costs, onCostChange, monthName, dayCount, storedMonths, lastSavedAt,
             onExportMonth, onExportAll, onImportFile, onExportCsv, onCopySummary, onClearMonth,
-            onExportCard, soundOn, onToggleSound
+            onExportCard, onCopySettlement, onOpenLedger, soundOn, onToggleSound
         }) {
             const [armed, setArmed] = useState(false);
             const fileRef = useRef(null);
@@ -2367,6 +2575,10 @@
                                          title="Exportar reporte CSV" detail="Con horas, km y $/hr · listo para Excel" />
                             <SheetButton onClick={onExportCard} icon={<IconLayers size={18} />} accent="emerald"
                                          title="Exportar ficha de rendimiento" detail="Imagen .png 1080×1920 lista para compartir" />
+                            <SheetButton onClick={onCopySettlement} icon={<IconClipboard size={18} />} accent="sky"
+                                         title="Cédula de liquidación" detail="Cuadro contable monoespaciado al portapapeles" />
+                            <SheetButton onClick={onOpenLedger} icon={<IconGrid size={18} />} accent="violet"
+                                         title="Libro diario contable" detail="Partida doble por jornada, con exportación CSV" />
                             <SheetButton onClick={onCopySummary} icon={<IconClipboard size={18} />} accent="amber"
                                          title="Copiar resumen ejecutivo" detail="Texto listo para WhatsApp o notas" />
                         </div>
@@ -2769,6 +2981,399 @@
                 {hint && <p className="text-[9px] text-slate-500 num truncate">{hint}</p>}
             </div>
         );
+
+        /* ============================================================================
+           15b-4. ESTADO DE RESULTADOS EN CASCADA
+           ============================================================================ */
+        const LedgerRow = ({ label, value, detail, tone = 'normal', indent, strong, rule }) => {
+            const tones = {
+                normal: 'text-slate-100', cost: 'text-rose-300',
+                subtotal: 'text-sky-200', result: 'text-emerald-300', muted: 'text-slate-300'
+            };
+            return (
+                <div className={`flex items-baseline justify-between gap-3 py-1.5 ${rule ? 'border-t border-slate-700 mt-1 pt-2' : ''}`}>
+                    <span className={`min-w-0 ${indent ? 'pl-3' : ''}`}>
+                        <span className={`block text-[11px] ${strong ? 'font-bold' : 'font-medium'} ${
+                            tone === 'cost' ? 'text-slate-300' : 'text-slate-200'} truncate`}>{label}</span>
+                        {detail && <span className="block text-[9px] text-slate-400 num truncate">{detail}</span>}
+                    </span>
+                    <span className={`num shrink-0 ${strong ? 'text-[15px] font-extrabold' : 'text-[13px] font-bold'} ${tones[tone]}`}>
+                        {value}
+                    </span>
+                </div>
+            );
+        };
+
+        function IncomeStatementPanel({ metrics, basis, onBasis }) {
+            const { cash } = useCash();
+            const [open, setOpen] = useState(false);
+            const accrual = basis === 'accrual';
+
+            return (
+                <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
+                    <button onClick={() => { setOpen(o => !o); feedback.tap(); }} aria-expanded={open}
+                            className="focus-ring w-full flex items-center justify-between gap-3 p-4 text-left">
+                        <span className="flex items-center gap-2 min-w-0">
+                            <span className="text-emerald-400 shrink-0"><IconGrid size={16} /></span>
+                            <span className="min-w-0">
+                                <span className="block text-slate-100 text-sm font-semibold tracking-tight">Estado de resultados</span>
+                                <span className="block text-slate-400 text-[11px] truncate num">
+                                    Margen de contribución {pctText(metrics.contributionRatio, 1)} ·
+                                    utilidad de caja {cash(metrics.operatingCashFlow, 0)}
+                                </span>
+                            </span>
+                        </span>
+                        <span className={`shrink-0 text-slate-400 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}>
+                            <IconChevronD size={18} />
+                        </span>
+                    </button>
+
+                    {open && (
+                        <div className="px-4 pb-4 fade-in">
+                            {/* Conmutador de base contable */}
+                            <div className="grid grid-cols-2 gap-2 mb-3">
+                                <button onClick={() => { onBasis('cash'); feedback.tap(); }} aria-pressed={!accrual}
+                                        style={{ minHeight: '54px' }}
+                                        className={`focus-ring press rounded-xl border px-3 text-left transition-colors ${
+                                            !accrual ? 'bg-emerald-500/15 border-emerald-500/60 text-emerald-200'
+                                                     : 'bg-slate-800/50 border-slate-700 text-slate-300'}`}>
+                                    <span className="block text-[12px] font-bold">Flujo de caja</span>
+                                    <span className="block text-[10px] opacity-80">Gasto el día que se pagó</span>
+                                </button>
+                                <button onClick={() => { onBasis('accrual'); feedback.tap(); }} aria-pressed={accrual}
+                                        style={{ minHeight: '54px' }}
+                                        className={`focus-ring press rounded-xl border px-3 text-left transition-colors ${
+                                            accrual ? 'bg-sky-500/15 border-sky-500/60 text-sky-200'
+                                                    : 'bg-slate-800/50 border-slate-700 text-slate-300'}`}>
+                                    <span className="block text-[12px] font-bold">Devengado</span>
+                                    <span className="block text-[10px] opacity-80">Consumo prorrateado por km</span>
+                                </button>
+                            </div>
+
+                            {accrual && (
+                                <p className={`text-[10px] rounded-lg px-2.5 py-2 mb-3 ${
+                                    metrics.accrualActive ? 'bg-sky-950/30 border border-sky-900/50 text-sky-200'
+                                                          : 'bg-amber-950/30 border border-amber-900/50 text-amber-200'}`}>
+                                    {metrics.accrualActive
+                                        ? `Costo medio ponderado ${cash(metrics.weightedGasPerKm)} por km. El combustible se imputa por kilómetros recorridos, no por la fecha de la carga; el total del mes no cambia.`
+                                        : 'Captura kilómetros en las jornadas para poder prorratear el consumo: sin km la vista devengada no tiene base de reparto.'}
+                                </p>
+                            )}
+
+                            <div className="rounded-xl bg-slate-950/60 border border-slate-800 px-3 py-2">
+                                <LedgerRow label="Ingresos operativos netos" strong tone="normal"
+                                           detail={`${metrics.workedDays} jornadas liquidadas`}
+                                           value={cash(metrics.totalEarned)} />
+
+                                <LedgerRow label="(−) Combustible" tone="cost" indent
+                                           detail={accrual && metrics.accrualActive
+                                               ? `devengado · pagado ${cash(metrics.totalGasPaid, 0)}`
+                                               : `${pctText(metrics.fuelAbsorption, 1)} del ingreso`}
+                                           value={`(${cash(metrics.totalGas)})`} />
+                                <LedgerRow label="(−) Peajes y casetas" tone="cost" indent
+                                           value={`(${cash(metrics.totalTolls)})`} />
+
+                                <LedgerRow label="(=) Margen de contribución" strong tone="subtotal" rule
+                                           detail={`Ratio ${pctText(metrics.contributionRatio, 1)}`}
+                                           value={cash(metrics.contributionMargin)} />
+
+                                <LedgerRow label="(−) Lavado y acondicionamiento" tone="cost" indent
+                                           value={`(${cash(metrics.totalWash)})`} />
+                                <LedgerRow label="(−) Misceláneos de ruta" tone="cost" indent
+                                           value={`(${cash(metrics.totalMisc)})`} />
+
+                                <LedgerRow label="(=) Utilidad neta operativa de caja" strong tone="result" rule
+                                           detail={`Margen operativo ${pctText(metrics.returnRate, 1)}`}
+                                           value={cash(metrics.operatingCashFlow)} />
+                            </div>
+
+                            {/* Ratios de unit economics */}
+                            <p className="text-[10px] uppercase tracking-[0.12em] font-bold text-slate-300 mt-4 mb-2">
+                                Ratios de eficiencia
+                            </p>
+                            <div className="grid grid-cols-2 gap-2">
+                                <MiniStat label="Absorción de combustible" value={pctText(metrics.fuelAbsorption, 1)}
+                                          tone={metrics.fuelAbsorption <= 25 ? 'text-emerald-400' : metrics.fuelAbsorption <= 40 ? 'text-amber-300' : 'text-rose-300'}
+                                          hint="del ingreso depositado" />
+                                <MiniStat label="Costo por hora de servicio"
+                                          value={metrics.costPerServiceHour !== null ? cash(metrics.costPerServiceHour) : '—'}
+                                          hint={metrics.totalHours > 0 ? `${money(metrics.totalHours, 1)} h activas` : 'captura horas'} />
+                                <MiniStat label="Retención marginal"
+                                          value={pctText(metrics.marginalRetention * 100, 1)}
+                                          tone="text-sky-300"
+                                          hint="de cada peso extra facturado" />
+                                <MiniStat label="Apalancamiento operativo"
+                                          value={metrics.operatingLeverage !== null ? `${metrics.operatingLeverage.toFixed(2)}×` : '—'}
+                                          hint="margen ÷ utilidad de caja" />
+                            </div>
+                            <p className="text-[10px] text-slate-400 mt-2">
+                                Cubiertos los costos de la jornada, cada peso adicional deja
+                                {' '}<span className="text-emerald-300 font-bold num">{pctText(metrics.marginalRetention * 100, 0)}</span>
+                                {' '}íntegro en caja: los peajes y el combustible ya están pagados.
+                            </p>
+                        </div>
+                    )}
+                </section>
+            );
+        }
+
+        /* ============================================================================
+           15b-5. CONCILIACIÓN SEMANAL Y ARQUEO DE TESORERÍA
+           ============================================================================ */
+        function SettlementPanel({ metrics, settlements, onSettlement, onPickDay }) {
+            const { cash } = useCash();
+            const [open, setOpen] = useState(false);
+            const weeks = metrics.weeks;
+
+            return (
+                <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
+                    <button onClick={() => { setOpen(o => !o); feedback.tap(); }} aria-expanded={open}
+                            className="focus-ring w-full flex items-center justify-between gap-3 p-4 text-left">
+                        <span className="flex items-center gap-2 min-w-0">
+                            <span className="text-sky-400 shrink-0"><IconCalendar size={16} /></span>
+                            <span className="min-w-0">
+                                <span className="block text-slate-100 text-sm font-semibold tracking-tight">Conciliación semanal</span>
+                                <span className="block text-slate-400 text-[11px] truncate num">
+                                    {weeks.length} cortes · efectivo en mano {cash(metrics.totalCashOnHand, 0)}
+                                </span>
+                            </span>
+                        </span>
+                        <span className={`shrink-0 text-slate-400 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}>
+                            <IconChevronD size={18} />
+                        </span>
+                    </button>
+
+                    {open && (
+                        <div className="px-4 pb-4 space-y-2.5 fade-in">
+                            {/* Arqueo dual del mes */}
+                            <div className="grid grid-cols-3 gap-2">
+                                <MiniStat label="Efectivo cobrado" value={cash(metrics.totalCashCollected, 0)} tone="text-emerald-400" />
+                                <MiniStat label="Saldo en app" value={cash(metrics.totalAppDeposit, 0)} tone="text-sky-300" />
+                                <MiniStat label="Efectivo líquido" value={cash(metrics.totalCashOnHand, 0)}
+                                          tone={metrics.totalCashOnHand >= 0 ? 'text-emerald-400' : 'text-rose-300'}
+                                          hint="tras pagar ruta" />
+                            </div>
+                            {metrics.totalCashOnHand < 0 && (
+                                <p className="text-[11px] rounded-lg bg-rose-950/30 border border-rose-900/50 text-rose-200 px-2.5 py-2">
+                                    Financiaste {cash(Math.abs(metrics.totalCashOnHand))} de costos operativos con dinero propio:
+                                    el efectivo cobrado no alcanzó a cubrir gasolina, peajes y varios.
+                                </p>
+                            )}
+
+                            {weeks.map(week => {
+                                const record = settlements[week.index] || {};
+                                const bank = num(record.bank);
+                                const diff = bank > 0 ? bank - week.earned : 0;
+                                const squared = bank > 0 && Math.abs(diff) < 0.01;
+                                return (
+                                    <div key={week.index} className="rounded-xl bg-slate-800/40 border border-slate-800 px-3 py-2.5">
+                                        <div className="flex items-center justify-between gap-2">
+                                            <button onClick={() => onPickDay(week.fromId)}
+                                                    className="focus-ring text-left min-w-0">
+                                                <span className="block text-[12px] font-bold text-slate-100 num truncate">
+                                                    Semana {week.index} · {week.from} – {week.to}
+                                                </span>
+                                                <span className="block text-[10px] text-slate-400 num">
+                                                    {week.worked} {week.worked === 1 ? 'jornada' : 'jornadas'} liquidadas
+                                                </span>
+                                            </button>
+                                            <span className={`shrink-0 text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded border ${
+                                                record.reconciled ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                                                                  : 'bg-slate-700/50 text-slate-300 border-slate-600'}`}>
+                                                {record.reconciled ? 'Conciliado' : 'En curso'}
+                                            </span>
+                                        </div>
+
+                                        <div className="grid grid-cols-3 gap-2 mt-2">
+                                            <MiniStat label="Facturado" value={cash(week.earned, 0)} tone="text-emerald-400" />
+                                            <MiniStat label="Egresos" value={cash(week.egress, 0)} tone="text-rose-300" />
+                                            <MiniStat label="Margen" value={cash(week.margin, 0)}
+                                                      tone={week.margin >= 0 ? 'text-slate-100' : 'text-rose-300'}
+                                                      hint={pctText(week.marginRatio, 0)} />
+                                        </div>
+
+                                        <div className="flex items-end gap-2 mt-2">
+                                            <div className="flex-1 min-w-0">
+                                                <MoneyField id={`bank-${week.index}`} label="Depósito del banco" tone="unit" compact
+                                                            value={record.bank === undefined ? '' : record.bank}
+                                                            onChange={(v) => onSettlement(week.index, { bank: v })} />
+                                            </div>
+                                            <button onClick={() => onSettlement(week.index, { reconciled: !record.reconciled })}
+                                                    style={{ minHeight: '54px', minWidth: '54px' }}
+                                                    aria-pressed={!!record.reconciled}
+                                                    aria-label={`Marcar semana ${week.index} como conciliada`}
+                                                    className={`focus-ring press rounded-xl border flex items-center justify-center px-3 transition-colors ${
+                                                        record.reconciled ? 'bg-emerald-600/20 border-emerald-500/60 text-emerald-300'
+                                                                          : 'bg-slate-800 border-slate-700 text-slate-300'}`}>
+                                                <IconCheck size={20} />
+                                            </button>
+                                        </div>
+
+                                        {bank > 0 && (
+                                            <p className={`text-[11px] num mt-1.5 ${
+                                                squared ? 'text-emerald-300'
+                                                        : Math.abs(diff) < 1 ? 'text-amber-300' : 'text-rose-300'}`}>
+                                                {squared
+                                                    ? 'Cuadra exacto con los registros de la semana.'
+                                                    : `Descuadre de ${cash(Math.abs(diff))} ${diff > 0 ? 'a favor del banco' : 'a favor de tus registros'}${Math.abs(diff) < 1 ? ' (ajuste de centavos de la plataforma)' : ''}.`}
+                                            </p>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                </section>
+            );
+        }
+
+        /* ============================================================================
+           15b-6. ANÁLISIS DE VARIACIONES PRESUPUESTARIAS
+           ============================================================================ */
+        function VariancePanel({ metrics }) {
+            const { cash } = useCash();
+            const v = metrics.variance;
+            const deficit = v.total < 0;
+
+            const bar = (share, tone) => (
+                <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden mt-1">
+                    <div className={`${tone} h-1.5 rounded-full transition-all duration-500`}
+                         style={{ width: `${clamp(share, 0, 100)}%` }}></div>
+                </div>
+            );
+
+            const diagnosis = () => {
+                if (Math.abs(v.total) < 1) return 'La operación va exactamente sobre el presupuesto del mes.';
+                const dominant = v.volumeShare >= v.performanceShare && v.volumeShare >= v.residualShare
+                    ? 'volumen' : (v.performanceShare >= v.residualShare ? 'rendimiento' : 'calendario');
+                const word = deficit ? 'del déficit' : 'del excedente';
+                if (dominant === 'volumen') {
+                    return `El ${pctText(v.volumeShare, 0)} ${word} se explica por los días trabajados frente a los programados (volumen); el ${pctText(v.performanceShare, 0)} por el rendimiento de cada jornada.`;
+                }
+                if (dominant === 'rendimiento') {
+                    return `El ${pctText(v.performanceShare, 0)} ${word} viene del rendimiento por jornada respecto al objetivo diario; el ${pctText(v.volumeShare, 0)} del número de días trabajados.`;
+                }
+                return `El ${pctText(v.residualShare, 0)} ${word} corresponde a jornadas programadas que todavía no se trabajan; el resto se reparte entre volumen y rendimiento.`;
+            };
+
+            return (
+                <section className="bg-slate-900 rounded-2xl border border-slate-800 p-4">
+                    <div className="flex items-start justify-between gap-3 mb-3">
+                        <div className="min-w-0">
+                            <h2 className="text-slate-100 text-sm font-semibold tracking-tight">Análisis de variaciones</h2>
+                            <p className="text-slate-400 text-[11px]">Real contra presupuesto, descompuesto por causa</p>
+                        </div>
+                        <span className={`shrink-0 text-lg font-extrabold num ${deficit ? 'text-rose-300' : 'text-emerald-400'}`}>
+                            {v.total >= 0 ? '+' : '−'}{cash(Math.abs(v.total), 0)}
+                        </span>
+                    </div>
+
+                    <div className="space-y-2.5">
+                        <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3 py-2.5">
+                            <div className="flex items-baseline justify-between gap-2">
+                                <span className="text-[11px] font-bold text-slate-100">Variación volumen</span>
+                                <span className={`text-[13px] font-bold num ${v.volume >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>
+                                    {v.volume >= 0 ? '+' : '−'}{cash(Math.abs(v.volume), 0)}
+                                </span>
+                            </div>
+                            <p className="text-[10px] text-slate-400 num">
+                                {v.workedDays} días trabajados vs. {v.goalDays} programados × meta media {cash(v.avgDailyGoal, 0)}
+                            </p>
+                            {bar(v.volumeShare, v.volume >= 0 ? 'bg-emerald-500' : 'bg-rose-500')}
+                        </div>
+
+                        <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3 py-2.5">
+                            <div className="flex items-baseline justify-between gap-2">
+                                <span className="text-[11px] font-bold text-slate-100">Variación rendimiento</span>
+                                <span className={`text-[13px] font-bold num ${v.performance >= 0 ? 'text-emerald-400' : 'text-rose-300'}`}>
+                                    {v.performance >= 0 ? '+' : '−'}{cash(Math.abs(v.performance), 0)}
+                                </span>
+                            </div>
+                            <p className="text-[10px] text-slate-400">
+                                Suma de lo que cada jornada trabajada quedó por encima o por debajo de su objetivo
+                            </p>
+                            {bar(v.performanceShare, v.performance >= 0 ? 'bg-emerald-500' : 'bg-rose-500')}
+                        </div>
+
+                        <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3 py-2.5">
+                            <div className="flex items-baseline justify-between gap-2">
+                                <span className="text-[11px] font-bold text-slate-100">Jornadas por cursar</span>
+                                <span className="text-[13px] font-bold num text-slate-300">
+                                    {v.residual >= 0 ? '+' : '−'}{cash(Math.abs(v.residual), 0)}
+                                </span>
+                            </div>
+                            <p className="text-[10px] text-slate-400">
+                                Presupuesto de días programados que aún no se registran
+                            </p>
+                            {bar(v.residualShare, 'bg-slate-500')}
+                        </div>
+                    </div>
+
+                    <p className="text-[11px] text-slate-300 mt-3 pt-3 border-t border-slate-800">{diagnosis()}</p>
+                </section>
+            );
+        }
+
+        /* ============================================================================
+           15b-7. AUDITOR DE ASIENTOS Y CONTROL INTERNO
+           ============================================================================ */
+        function AuditorPanel({ flags, onPickDay }) {
+            const [open, setOpen] = useState(false);
+            const errors = flags.filter(f => f.severity === 'error').length;
+            const warns = flags.filter(f => f.severity === 'warn').length;
+
+            const severityStyle = {
+                error: 'bg-rose-950/30 border-rose-900/60 text-rose-200',
+                warn: 'bg-amber-950/25 border-amber-900/50 text-amber-200',
+                info: 'bg-sky-950/25 border-sky-900/50 text-sky-200'
+            };
+
+            return (
+                <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
+                    <button onClick={() => { setOpen(o => !o); feedback.tap(); }} aria-expanded={open}
+                            className="focus-ring w-full flex items-center justify-between gap-3 p-4 text-left">
+                        <span className="flex items-center gap-2 min-w-0">
+                            <span className={flags.length === 0 ? 'text-emerald-400 shrink-0' : 'text-amber-400 shrink-0'}>
+                                {flags.length === 0 ? <IconCheck size={16} /> : <IconAlert size={16} />}
+                            </span>
+                            <span className="min-w-0">
+                                <span className="block text-slate-100 text-sm font-semibold tracking-tight">Auditoría de asientos</span>
+                                <span className="block text-slate-400 text-[11px] truncate">
+                                    {flags.length === 0
+                                        ? 'Sin observaciones: el registro del mes cuadra'
+                                        : `${flags.length} ${flags.length === 1 ? 'observación' : 'observaciones'}${errors > 0 ? ` · ${errors} crítica${errors === 1 ? '' : 's'}` : ''}${warns > 0 ? ` · ${warns} por revisar` : ''}`}
+                                </span>
+                            </span>
+                        </span>
+                        <span className={`shrink-0 text-slate-400 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}>
+                            <IconChevronD size={18} />
+                        </span>
+                    </button>
+
+                    {open && (
+                        <div className="px-4 pb-4 space-y-2 fade-in">
+                            {flags.length === 0 ? (
+                                <p className="text-[12px] text-slate-300">
+                                    Ninguna jornada presenta horas o kilómetros sin ingreso, costos sin actividad
+                                    ni márgenes fuera de rango.
+                                </p>
+                            ) : flags.map((flag, i) => (
+                                <button key={`${flag.id}-${flag.type}-${i}`}
+                                        onClick={() => { onPickDay(flag.id); feedback.tap(); }}
+                                        style={{ minHeight: '54px' }}
+                                        className={`focus-ring press w-full text-left rounded-xl border px-3 py-2.5 transition-colors ${severityStyle[flag.severity]}`}>
+                                    <span className="flex items-center justify-between gap-2">
+                                        <span className="text-[12px] font-bold truncate">{flag.title}</span>
+                                        <span className="text-[11px] font-bold num shrink-0">{flag.label} ›</span>
+                                    </span>
+                                    <span className="block text-[10px] opacity-85 num mt-0.5">{flag.detail}</span>
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                </section>
+            );
+        }
 
         /* ============================================================================
            15c. PACING ADAPTATIVO Y PROYECCIÓN POR PERFIL DE DÍA
@@ -3420,6 +4025,228 @@
         };
 
         /* ============================================================================
+           15e-3. CÉDULA DE LIQUIDACIÓN Y LIBRO DIARIO
+           ============================================================================ */
+        /* Cuadro monoespaciado listo para archivar o pegar en una hoja de cálculo */
+        const buildSettlementSheet = (metrics, monthName, generatedAt) => {
+            const WIDTH = 46;
+            const line = (char) => char.repeat(WIDTH);
+            const amount = (value) => {
+                const text = num(value).toLocaleString('es-MX',
+                    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                return text.padStart(14);
+            };
+            const row = (label, value) => label.padEnd(WIDTH - 14).slice(0, WIDTH - 14) + amount(value);
+            const pctRow = (label, value) => label.padEnd(WIDTH - 14).slice(0, WIDTH - 14)
+                + (pctText(value, 1)).padStart(14);
+            const unitRow = (label, value, suffix) => label.padEnd(WIDTH - 14).slice(0, WIDTH - 14)
+                + (money(value, 2) + suffix).padStart(14);
+
+            const out = [];
+            out.push(line('='));
+            out.push('CEDULA DE LIQUIDACION Y CIERRE DE PERIODO');
+            out.push(monthName.toUpperCase());
+            out.push(`Emitida: ${generatedAt}`);
+            out.push(line('='));
+            out.push('');
+            out.push(row('INGRESO BRUTO DEPOSITADO', metrics.totalEarned));
+            out.push(line('-'));
+            out.push('COSTOS VARIABLES DE RUTA');
+            out.push(row('  Combustible', -metrics.totalGas));
+            out.push(row('  Peajes y casetas', -metrics.totalTolls));
+            out.push(row('  Total costos variables', -metrics.totalDirectCosts));
+            out.push(line('-'));
+            out.push(row('MARGEN DE CONTRIBUCION', metrics.contributionMargin));
+            out.push(pctRow('  Ratio de contribucion', metrics.contributionRatio));
+            out.push(line('-'));
+            out.push('GASTOS OPERATIVOS (OPEX)');
+            out.push(row('  Lavado y acondicionamiento', -metrics.totalWash));
+            out.push(row('  Miscelaneos de ruta', -metrics.totalMisc));
+            out.push(row('  Total OPEX', -metrics.totalOpex));
+            out.push(line('='));
+            out.push(row('UTILIDAD NETA DE CAJA', metrics.operatingCashFlow));
+            out.push(pctRow('  Margen operativo neto', metrics.returnRate));
+            out.push(line('='));
+            out.push('');
+            out.push('INDICADORES UNITARIOS');
+            out.push(pctRow('  Absorcion de combustible', metrics.fuelAbsorption));
+            if (metrics.totalKm > 0) {
+                out.push(unitRow('  Rendimiento por km', metrics.operatingCashFlow / metrics.totalKm, ' /km'));
+                out.push(unitRow('  Costo por km', metrics.cashPerKm || 0, ' /km'));
+            }
+            if (metrics.totalHours > 0) {
+                out.push(unitRow('  Rendimiento por hora', metrics.pocketPerHour || 0, ' /hr'));
+                out.push(unitRow('  Costo por hora servicio', metrics.costPerServiceHour || 0, ' /hr'));
+            }
+            out.push('');
+            out.push('OPERACION DEL PERIODO');
+            out.push(`  Jornadas liquidadas        ${String(metrics.workedDays).padStart(14)}`);
+            out.push(`  Metas cumplidas            ${String(metrics.achievedDays).padStart(14)}`);
+            if (metrics.totalKm > 0) out.push(`  Kilometros recorridos      ${money(metrics.totalKm, 0).padStart(14)}`);
+            if (metrics.totalHours > 0) out.push(`  Horas al volante           ${money(metrics.totalHours, 1).padStart(14)}`);
+            out.push(line('='));
+            out.push('Registro personal de jornadas. Base: flujo de caja.');
+            return out.join('\n');
+        };
+
+        /* Partida doble: cada jornada genera un asiento de ingreso y uno de costos */
+        const LEDGER_ACCOUNTS = {
+            bank: '1020 Bancos',
+            cash: '1010 Caja / Efectivo',
+            income: '4010 Ingresos operativos plataforma',
+            fuel: '5010 Combustible',
+            tolls: '5020 Peajes y casetas',
+            wash: '5030 Lavado y acondicionamiento',
+            misc: '5040 Miscelaneos de ruta'
+        };
+
+        const buildLedgerEntries = (days, computed) => {
+            const entries = [];
+            let balance = 0;
+            days.forEach((day, index) => {
+                const c = computed[index];
+                if (!c.hasData) return;
+                const seq = String(day.id).padStart(2, '0');
+
+                if (c.earned > 0) {
+                    /* El cobro entra por caja cuando se declaró efectivo; el resto, por banco */
+                    const viaCash = c.declaredSplit ? c.cashCollected : 0;
+                    const viaBank = c.declaredSplit ? Math.max(c.earned - viaCash, 0) : c.earned;
+                    if (viaBank > 0) {
+                        balance += viaBank;
+                        entries.push({ date: day.dateString, id: `${seq}-I1`, account: LEDGER_ACCOUNTS.bank,
+                                       concept: 'Deposito de plataforma', debit: viaBank, credit: 0, balance });
+                        entries.push({ date: day.dateString, id: `${seq}-I1`, account: LEDGER_ACCOUNTS.income,
+                                       concept: 'Ingreso operativo del turno', debit: 0, credit: viaBank, balance });
+                    }
+                    if (viaCash > 0) {
+                        balance += viaCash;
+                        entries.push({ date: day.dateString, id: `${seq}-I2`, account: LEDGER_ACCOUNTS.cash,
+                                       concept: 'Cobro en efectivo a bordo', debit: viaCash, credit: 0, balance });
+                        entries.push({ date: day.dateString, id: `${seq}-I2`, account: LEDGER_ACCOUNTS.income,
+                                       concept: 'Ingreso operativo del turno', debit: 0, credit: viaCash, balance });
+                    }
+                }
+
+                const costs = [
+                    { key: 'fuel', value: c.gasPaid, concept: 'Carga de combustible' },
+                    { key: 'tolls', value: c.tolls, concept: 'Peajes de ruta' },
+                    { key: 'wash', value: c.wash, concept: 'Lavado del vehiculo' },
+                    { key: 'misc', value: c.misc, concept: 'Miscelaneos de operacion' }
+                ];
+                let costSeq = 0;
+                costs.forEach(cost => {
+                    if (cost.value <= 0) return;
+                    costSeq += 1;
+                    balance -= cost.value;
+                    const entryId = `${seq}-C${costSeq}`;
+                    entries.push({ date: day.dateString, id: entryId, account: LEDGER_ACCOUNTS[cost.key],
+                                   concept: cost.concept, debit: cost.value, credit: 0, balance });
+                    entries.push({ date: day.dateString, id: entryId, account: LEDGER_ACCOUNTS.cash,
+                                   concept: `Pago de ${cost.concept.toLowerCase()}`, debit: 0, credit: cost.value, balance });
+                });
+            });
+            return entries;
+        };
+
+        function LedgerSheet({ open, onClose, entries, monthName, onExport }) {
+            const { cash } = useCash();
+            useEffect(() => {
+                if (!open) return;
+                const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+                window.addEventListener('keydown', onKey);
+                return () => window.removeEventListener('keydown', onKey);
+            }, [open, onClose]);
+            if (!open) return null;
+
+            const totalDebit = entries.reduce((acc, e) => acc + e.debit, 0);
+            const totalCredit = entries.reduce((acc, e) => acc + e.credit, 0);
+            const balanced = Math.abs(totalDebit - totalCredit) < 0.01;
+
+            return (
+                <div className="fixed inset-0 z-[65] flex items-end sm:items-center justify-center"
+                     role="dialog" aria-modal="true" aria-label="Libro diario contable">
+                    <div className="absolute inset-0 bg-slate-950/85 backdrop-blur-sm" onClick={onClose}></div>
+                    <div className="relative w-full sm:max-w-2xl bg-slate-900 border-t sm:border border-slate-700 rounded-t-3xl sm:rounded-2xl p-4 sheet-in max-h-[88vh] overflow-y-auto"
+                         style={{ paddingBottom: 'calc(1rem + env(safe-area-inset-bottom, 0px))' }}>
+                        <div className="flex items-start justify-between mb-3">
+                            <div className="min-w-0">
+                                <h2 className="text-slate-100 font-bold tracking-tight">Libro diario</h2>
+                                <p className="text-[11px] text-slate-400 num truncate">
+                                    {monthName} · {entries.length} movimientos ·
+                                    {balanced ? ' partida cuadrada' : ' revisar cuadre'}
+                                </p>
+                            </div>
+                            <button onClick={onClose} aria-label="Cerrar"
+                                    style={{ minHeight: '54px', minWidth: '54px' }}
+                                    className="focus-ring press text-slate-300 hover:text-slate-100 rounded-xl flex items-center justify-center shrink-0">
+                                <IconClose size={22} />
+                            </button>
+                        </div>
+
+                        {entries.length === 0 ? (
+                            <p className="text-[12px] text-slate-300 py-6 text-center">
+                                Todavía no hay movimientos que asentar en este periodo.
+                            </p>
+                        ) : (
+                            <>
+                                <div className="overflow-x-auto rounded-xl border border-slate-800">
+                                    <table className="w-full text-[11px] num" style={{ minWidth: '520px' }}>
+                                        <thead>
+                                            <tr className="bg-slate-800/70 text-slate-200">
+                                                <th className="text-left font-bold px-2 py-2">Fecha</th>
+                                                <th className="text-left font-bold px-2 py-2">Asiento</th>
+                                                <th className="text-left font-bold px-2 py-2">Cuenta</th>
+                                                <th className="text-right font-bold px-2 py-2">Debe</th>
+                                                <th className="text-right font-bold px-2 py-2">Haber</th>
+                                                <th className="text-right font-bold px-2 py-2">Saldo</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {entries.map((entry, i) => (
+                                                <tr key={`${entry.id}-${i}`}
+                                                    className={i % 2 === 0 ? 'bg-slate-900' : 'bg-slate-900/40'}>
+                                                    <td className="px-2 py-1.5 text-slate-300 whitespace-nowrap">{entry.date}</td>
+                                                    <td className="px-2 py-1.5 text-slate-400 whitespace-nowrap">{entry.id}</td>
+                                                    <td className="px-2 py-1.5 text-slate-200">
+                                                        <span className="block">{entry.account}</span>
+                                                        <span className="block text-[9px] text-slate-500">{entry.concept}</span>
+                                                    </td>
+                                                    <td className="px-2 py-1.5 text-right text-emerald-300 whitespace-nowrap">
+                                                        {entry.debit > 0 ? cash(entry.debit) : ''}
+                                                    </td>
+                                                    <td className="px-2 py-1.5 text-right text-rose-300 whitespace-nowrap">
+                                                        {entry.credit > 0 ? cash(entry.credit) : ''}
+                                                    </td>
+                                                    <td className="px-2 py-1.5 text-right text-slate-100 whitespace-nowrap">
+                                                        {cash(entry.balance)}
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                        <tfoot>
+                                            <tr className="bg-slate-800/70 text-slate-100 font-bold">
+                                                <td className="px-2 py-2" colSpan={3}>Sumas iguales</td>
+                                                <td className="px-2 py-2 text-right text-emerald-300">{cash(totalDebit)}</td>
+                                                <td className="px-2 py-2 text-right text-rose-300">{cash(totalCredit)}</td>
+                                                <td className="px-2 py-2 text-right">{cash(entries[entries.length - 1].balance)}</td>
+                                            </tr>
+                                        </tfoot>
+                                    </table>
+                                </div>
+
+                                <button onClick={onExport} style={{ minHeight: '56px' }}
+                                        className="focus-ring press w-full mt-3 flex items-center justify-center gap-2 rounded-xl bg-violet-600/20 border border-violet-500/50 text-violet-200 font-bold text-[13px] transition-colors">
+                                    <IconDownload size={18} /> Exportar libro diario a CSV
+                                </button>
+                            </>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        /* ============================================================================
            15f. DOCK ERGONÓMICO DE UNA MANO (THUMB ZONE)
            Todo lo accionable en marcha vive aquí: en los ~280 px inferiores, con
            objetivos de 56 px o más y separación generosa (ley de Fitts).
@@ -3559,6 +4386,7 @@
             const [toolsOpen, setToolsOpen] = useState(false);
             const [shiftOpen, setShiftOpen] = useState(false);
             const [hudOpen, setHudOpen] = useState(false);
+            const [ledgerOpen, setLedgerOpen] = useState(false);
             const [pickerOpen, setPickerOpen] = useState(false);
             const [toast, setToast] = useState(null);
             const [lastSavedAt, setLastSavedAt] = useState(null);
@@ -3642,9 +4470,10 @@
                 return now.getDate();
             }, [year, monthIndex, totalDays]);
 
-            const metrics = useFinancialTelemetry(list, costs, elapsedDays);
+            const basis = meta.accountingBasis === 'accrual' ? 'accrual' : 'cash';
+            const metrics = useFinancialTelemetry(list, costs, elapsedDays, basis);
             const deferredList = useDeferredValue(list);
-            const deferredMetrics = useFinancialTelemetry(deferredList, costs, elapsedDays);
+            const deferredMetrics = useFinancialTelemetry(deferredList, costs, elapsedDays, basis);
             const prediction = usePredictiveModels(deferredList, deferredMetrics, costs, elapsedDays);
 
             /* Muestra de jornadas para la campana de densidad */
@@ -3770,6 +4599,30 @@
             const setPacingMode = useCallback((mode) => {
                 setMeta(prev => ({ ...prev, pacingMode: mode }));
             }, []);
+
+            const setAccountingBasis = useCallback((next) => {
+                setMeta(prev => ({ ...prev, accountingBasis: next }));
+            }, []);
+
+            /* Conciliaciones bancarias por semana del mes visible */
+            const monthKeyId = monthId(year, monthIndex);
+            const settlements = useMemo(
+                () => (meta.settlements && meta.settlements[monthKeyId]) || {},
+                [meta.settlements, monthKeyId]);
+
+            const updateSettlement = useCallback((weekIndex, patch) => {
+                setMeta(prev => {
+                    const all = prev.settlements && typeof prev.settlements === 'object' ? prev.settlements : {};
+                    const monthRecord = all[monthKeyId] || {};
+                    const weekRecord = { ...(monthRecord[weekIndex] || {}), ...patch };
+                    return { ...prev, settlements: { ...all, [monthKeyId]: { ...monthRecord, [weekIndex]: weekRecord } } };
+                });
+                if (patch.reconciled !== undefined) feedback.confirm();
+            }, [monthKeyId]);
+
+            const ledgerEntries = useMemo(
+                () => buildLedgerEntries(deferredList, deferredMetrics.computed),
+                [deferredList, deferredMetrics]);
 
             const toggleStealth = useCallback(() => {
                 setMeta(prev => ({ ...prev, stealth: !prev.stealth }));
@@ -4039,6 +4892,63 @@
                     done(fallback());
                 }
             }, [metrics, year, monthIndex, totalDays, notify]);
+
+            const copyToClipboard = useCallback((text, okMessage) => {
+                const fallback = () => {
+                    try {
+                        const area = document.createElement('textarea');
+                        area.value = text;
+                        area.setAttribute('readonly', '');
+                        area.style.position = 'fixed';
+                        area.style.opacity = '0';
+                        document.body.appendChild(area);
+                        area.select();
+                        const ok = document.execCommand('copy');
+                        document.body.removeChild(area);
+                        return ok;
+                    } catch (err) { return false; }
+                };
+                const done = (ok) => {
+                    notify(ok ? okMessage : 'No se pudo copiar', ok ? 'ok' : 'warn');
+                    if (ok) feedback.confirm();
+                    setToolsOpen(false);
+                };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(() => done(true)).catch(() => done(fallback()));
+                } else {
+                    done(fallback());
+                }
+            }, [notify]);
+
+            const copySettlementSheet = useCallback(() => {
+                const generatedAt = new Date().toLocaleDateString('es-MX',
+                    { day: '2-digit', month: 'long', year: 'numeric' });
+                copyToClipboard(buildSettlementSheet(metrics, monthLabel(year, monthIndex), generatedAt),
+                                'Cédula de liquidación copiada');
+            }, [metrics, year, monthIndex, copyToClipboard]);
+
+            const exportLedgerCsv = useCallback(() => {
+                const header = ['Fecha', 'Asiento_ID', 'Cuenta_Contable', 'Concepto', 'Debe', 'Haber', 'Saldo_Neto_Acumulado'];
+                const escape = (cell) => {
+                    const text = String(cell);
+                    return /[",;\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+                };
+                const rows = ledgerEntries.map(entry => [
+                    entry.date, entry.id, entry.account, entry.concept,
+                    entry.debit > 0 ? entry.debit.toFixed(2) : '',
+                    entry.credit > 0 ? entry.credit.toFixed(2) : '',
+                    entry.balance.toFixed(2)
+                ].map(escape).join(','));
+                const totalDebit = ledgerEntries.reduce((acc, e) => acc + e.debit, 0);
+                const totalCredit = ledgerEntries.reduce((acc, e) => acc + e.credit, 0);
+                const totals = ['TOTAL', '', 'SUMAS IGUALES', monthLabel(year, monthIndex),
+                                totalDebit.toFixed(2), totalCredit.toFixed(2),
+                                (ledgerEntries.length ? ledgerEntries[ledgerEntries.length - 1].balance : 0).toFixed(2)
+                               ].map(escape).join(',');
+                const csv = '\uFEFF' + [header.join(','), ...rows, totals].join('\r\n');
+                const ok = downloadBlob(csv, `didi-libro-diario-${monthId(year, monthIndex)}.csv`, 'text/csv;charset=utf-8;');
+                notify(ok ? 'Libro diario exportado' : 'No se pudo generar la descarga', ok ? 'ok' : 'warn');
+            }, [ledgerEntries, year, monthIndex, downloadBlob, notify]);
 
             const exportCard = useCallback(() => {
                 try {
@@ -4323,6 +5233,15 @@
                                         sub={metrics.totalKm > 0 ? `${money(metrics.totalKm, 0)} km recorridos` : 'Captura km en el detalle'} />
                         </section>
 
+                        <IncomeStatementPanel metrics={metrics} basis={basis} onBasis={setAccountingBasis} />
+
+                        <VariancePanel metrics={metrics} />
+
+                        <SettlementPanel metrics={metrics} settlements={settlements}
+                                         onSettlement={updateSettlement} onPickDay={focusDay} />
+
+                        <AuditorPanel flags={deferredMetrics.auditFlags} onPickDay={focusDay} />
+
                         <PacingStrategyPanel metrics={metrics}
                                              mode={meta.pacingMode === 'record' ? 'record' : 'relief'}
                                              onMode={setPacingMode} />
@@ -4395,6 +5314,8 @@
                         onExportCsv={exportCsv}
                         onCopySummary={copySummary}
                         onExportCard={exportCard}
+                        onCopySettlement={copySettlementSheet}
+                        onOpenLedger={() => { setToolsOpen(false); setLedgerOpen(true); }}
                         onClearMonth={clearMonth}
                         soundOn={meta.sound !== false}
                         onToggleSound={() => {
@@ -4416,6 +5337,13 @@
                         undoState={undoState}
                         onUndo={undoLast}
                         onOpenHud={() => { setHudOpen(true); feedback.tap(); }} />
+
+                    <LedgerSheet
+                        open={ledgerOpen}
+                        onClose={() => setLedgerOpen(false)}
+                        entries={ledgerEntries}
+                        monthName={monthLabel(year, monthIndex)}
+                        onExport={exportLedgerCsv} />
 
                     <ShiftHud
                         open={hudOpen}
