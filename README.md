@@ -1,53 +1,93 @@
-# Telemetría DiDi — Septiembre 2026
+# Telemetría DiDi Pro
 
-Dashboard de telemetría financiera y rendimiento operativo para conductor de plataforma.
-Un único archivo autónomo (`index.html`) que corre en cualquier navegador móvil sin build ni servidor.
+Cockpit operativo de gestión financiera y vehicular para conductor de plataforma.
+Un único archivo autónomo (`index.html`) que corre en cualquier navegador móvil, sin build ni servidor,
+e instalable como app gracias a un manifest PWA embebido.
 
-## Cómo usarlo
+## Uso
 
-Abre `index.html` en el navegador del teléfono (o publícalo en GitHub Pages y guárdalo
-en la pantalla de inicio). No necesita instalación ni conexión tras la primera carga.
+Abre `index.html` en el navegador del teléfono y usa "Añadir a pantalla de inicio".
+El manifest (`display: standalone`, fondo `#020617`) y el icono de tacómetro van embebidos como Data URI,
+así que funciona igual servido por `file://` o por un servidor local.
 
-## Datos
+## Arquitectura de datos
 
-- Persistencia en `localStorage` bajo la clave **`didi-tracker-app`**.
-- Estructura de cada día intacta respecto a la versión anterior:
-  `id`, `dateString`, `dayName`, `goal`, `earned`, `gas`.
-- Migración no destructiva: los registros previos se conservan tal cual y solo se
-  completan los campos faltantes contra la plantilla base del mes (30 días de
-  Septiembre 2026 con las metas por defecto: 400 lunes/miércoles/jueves,
-  150 martes/viernes, 1000 sábados/domingos).
+| Clave | Contenido |
+| --- | --- |
+| `didi_telemetry_meta` | Mes activo, metas por defecto, parámetros de costo, modo sigilo |
+| `didi_data_YYYY_MM` | Un registro por mes (ej. `didi_data_2026_09`) |
+| `didi-tracker-app` | Clave original: se migra a `didi_data_2026_09` y se mantiene sincronizada |
 
-## Motor de telemetría
+- **Migración transparente:** al arrancar, si existe `didi-tracker-app` y aún no hay partición de
+  Septiembre 2026, se copia sin alterar un solo peso. La clave original nunca se borra y sigue
+  recibiendo los cambios de ese mes, así que la versión anterior del archivo la sigue abriendo.
+- **Campos por día:** `id`, `dateString`, `dayName`, `goal`, `earned`, `gas` (esquema original, intacto)
+  más los opcionales `hours`, `km`, `tolls`, `wash`, `misc`.
+- **Calendario real:** los días de cada mes y su día de la semana se calculan con `new Date`,
+  incluyendo años bisiestos (Febrero 2028 rinde 29 tarjetas).
+
+## Modelo financiero
+
+```
+Costo operativo = gasolina + km × (desgaste + depreciación) + casetas + lavado + varios
+Utilidad neta real = bruto − costo operativo
+```
+
+Los parámetros por kilómetro se editan en el menú (por defecto $0.45 de desgaste mecánico y
+neumáticos y $0.35 de depreciación y seguro prorrateado, $0.80/km en total).
 
 | Métrica | Cálculo |
 | --- | --- |
-| Utilidad neta real | `bruto − gasolina` |
-| Tasa de retorno / margen operativo | `neto / bruto × 100` |
-| Índice de eficiencia de combustible | `gasolina / bruto × 100` |
-| Proyección mensual (run-rate) | `promedio diario de jornadas trabajadas × 30`, bruto y neto |
-| Efectividad de jornadas | días con meta cumplida vs. días con ingreso registrado |
-| Neto por día | `earned − gas`, con margen e indicador de color por tarjeta |
+| Margen operativo real | `neto real / bruto × 100` |
+| Ratio de combustible | `gasolina / bruto × 100` |
+| Cuota diaria requerida | `brecha de meta / días sin registro` (o "meta superada por +$X") |
+| Proyección run-rate | `promedio por jornada trabajada × días del mes`, bruta y neta |
+| Efectividad | días con meta cumplida vs. días con ingreso |
+| Por jornada | `$/hr` neto, `$/km` de gasolina, desgaste y costo total por km |
 
-## Interfaz
+Si el gasto de gasolina por kilómetro de un día supera en 25% el promedio del mes, la tarjeta
+levanta un aviso de consumo alto (tráfico pesado o ineficiencia).
 
-- Dark mode sobre `slate-950`, tarjetas `slate-900` con bordes `slate-700/50`.
-- Sparkline SVG nativo con meta acumulada, ingreso real acumulado y proyección punteada.
-- Detección del día actual (`new Date().getDate()`): badge **HOY** y botón de salto directo.
-- Filtros: Todos · Cumplidos (≥100%) · Progreso (<100% y >0) · Sin registro ($0).
+## Control estadístico (SPC)
 
-## Herramientas de datos
+Sobre la utilidad neta de las jornadas trabajadas: media (μ), desviación estándar (σ),
+coeficiente de variación y límites de control a 1.5σ.
+CV <20% operación predecible · 20–40% variabilidad moderada · >40% operación errática.
+Los días fuera de los límites quedan marcados en su tarjeta (▲ pico / ▼ bajo) y son
+navegables desde el panel.
 
-Desde el ícono de la barra superior:
+## Visualización (SVG puro, sin librerías)
 
-- **Exportar respaldo** — `.json` con timestamp (`didi-respaldo-AAAAMMDD-HHMM.json`).
-- **Importar respaldo** — restaura desde un `.json` exportado.
-- **Exportar a CSV** — `ID, Fecha, Día, Meta, Bruto, Gasolina, Neto, Cumplimiento %`,
-  con BOM UTF-8 y fila de totales para abrir directo en Excel.
-- **Limpiar registros** — confirmación de dos pasos.
+- **Curva de acumulación** con meta acumulada, real acumulado, proyección punteada y
+  **inspector táctil**: arrastra el dedo para ver fecha, meta acumulada, real acumulado y neto del día.
+- **Matriz de productividad** tipo calendario: cada celda colorea el cumplimiento del día
+  y al tocarla salta a su tarjeta.
+- **Rentabilidad por día de la semana**: promedio de utilidad neta de lunes a domingo.
+
+## Ergonomía en cabina
+
+- **Modo sigilo:** el botón del ojo enmascara todos los montos (`$ ••••` y desenfoque) y deja
+  visibles los porcentajes, para consultar el tablero con pasajeros a bordo.
+- **Turno en caliente:** cuánto falta para la meta del día, a cuántos viajes equivale según el
+  ticket promedio y botones rápidos para sumar el viaje recién cerrado.
+- **Háptica:** micro-vibración de 15 ms al modificar un valor, donde el dispositivo la soporte.
+
+## Herramientas de respaldo
+
+- Exportar solo el mes (`didi-mes-YYYY-MM.json`) o la base histórica completa.
+- Importador inteligente: acepta el array original, el mes con metadatos y el histórico multimes;
+  fusiona sin tocar los meses que el archivo no incluye.
+- CSV con BOM UTF-8: `ID, Fecha, Día, Meta, Bruto, Gasolina, Neto, Cumplimiento %, Horas, Km, $/hr,
+  Casetas, Lavado, Varios, Costo Vehicular, Neto Real` y fila de totales.
+- Copiar resumen ejecutivo al portapapeles, listo para WhatsApp.
+- Limpieza del mes visible con confirmación de dos pasos (los demás meses no se tocan).
 
 ## Stack
 
-React 18 + Babel standalone + Tailwind CSS, todos por CDN. Iconografía SVG inline,
-sin dependencias de fuentes de iconos. Los campos monetarios son `inputMode="decimal"`
-con saneamiento de teclado que impide `NaN`, signos, notación científica o puntos duplicados.
+React 18, ReactDOM 18 y Babel Standalone desde cdnjs, más Tailwind CSS por CDN.
+Cero librerías de gráficos o iconos: todo es SVG inline. Los cálculos pesados van en `useMemo`,
+los handlers en `useCallback` y las tarjetas están memoizadas con estadísticas diferidas
+(`useDeferredValue`) para que escribir no dispare el recálculo de las 31 tarjetas.
+
+Nota: al abrir Septiembre 2026 sin datos previos, el día 1 conserva la semilla histórica
+de $189.61 que traía el archivo original.
