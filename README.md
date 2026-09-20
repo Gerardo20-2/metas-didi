@@ -4,6 +4,28 @@ Sistema de contabilidad analítica y contraloría de caja para conductor de plat
 Un único archivo autónomo (`index.html`) que corre en cualquier navegador móvil, sin build ni servidor,
 e instalable como app gracias a un manifest PWA embebido.
 
+## Navegación: tres pestañas
+
+La app se organiza en una barra inferior fija de 62 px dentro de la zona del pulgar.
+
+| Pestaña | Para qué sirve | Qué contiene |
+| --- | --- | --- |
+| **Registro** (por defecto) | Capturar en un alto | Banner del turno de hoy con meta, depositado, gasolina y bolsillo, acceso al HUD, filtros con contadores y la lista de jornadas |
+| **Cockpit** | Revisar el mes | Ganancia de bolsillo, cuota diaria, tacómetro de pacing, KPIs, curva acumulada, estado de resultados, variaciones, conciliación y auditoría |
+| **Inteligencia** | Analizar fuera de turno | Monte Carlo, Holt, simulador, heatmap, rentabilidad por día y control estadístico |
+
+**El problema que resuelve:** antes, el primer campo de captura quedaba a **4,393 px** de scroll,
+sepultado bajo los módulos analíticos. Ahora está a **415 px** y visible sin desplazarse, con el
+documento reducido de 13,396 a 7,458 px y el DOM inicial de 2,097 a 1,345 nodos.
+
+Tocar un día en el heatmap, en la auditoría, en el SPC o en una semana de la conciliación cambia
+automáticamente a **Registro** y centra la tarjeta correspondiente.
+
+Las pestañas pesadas se montan la primera vez que se abren y ya no se desmontan: el cambio
+posterior es instantáneo y la simulación Monte Carlo no se ejecuta hasta abrir Inteligencia.
+El análisis por jornada (ritmo del turno, margen de seguridad y punto de equilibrio) vive dentro
+del detalle plegable de cada tarjeta, para que la cara visible tenga solo meta, depositado y gasolina.
+
 ## Uso
 
 Abre `index.html` en el navegador del teléfono y usa "Añadir a pantalla de inicio".
@@ -186,9 +208,8 @@ navegables desde el panel.
 
 Diseñada para operarse con una mano, con el teléfono en el soporte y el coche en movimiento.
 
-- **Dock de zona del pulgar:** todo lo accionable en marcha (dial de registro, switch de descanso,
-  deshacer y filtros) vive fijo en la franja inferior. Las gráficas y KPIs quedan arriba como
-  zona de lectura pasiva.
+- **Dock de zona del pulgar:** en la pestaña Registro, todo lo accionable en marcha (dial de
+  captura, switch de descanso, deshacer y filtros) vive fijo justo encima de la barra de pestañas.
 - **Objetivos táctiles:** ningún control del dock baja de 54 px; el dial usa botones de 64 px
   con separación generosa para tolerar el pulso en movimiento.
 - **Buffer de deshacer:** cualquier toque en falso se revierte durante 5 segundos desde el dock.

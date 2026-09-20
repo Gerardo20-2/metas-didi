@@ -1201,7 +1201,20 @@
         };
 
         /* Hook: envuelve los modelos pesados y los memoiza sobre la lista diferida */
-        const usePredictiveModels = (days, metrics, costs, elapsedDays) => useMemo(() => {
+        const IDLE_PREDICTION = {
+            mu: 0, sigma: 0, worked: 0, cv: 0, enoughData: false, elapsedMs: 0, idle: true,
+            monteCarlo: { runs: 0, days: 0, probability: 0, p5: 0, p10: 0, p50: 0, p90: 0, p95: 0,
+                          expected: 0, goal: 0, mean: 0, sd: 0, degenerate: true },
+            holt: { level: 0, trend: 0, forecast: 0, fitted: [], n: 0 },
+            holtPocket: { level: 0, trend: 0, forecast: 0, fitted: [], n: 0 },
+            oee: { availability: 0, performance: null, quality: 0, oee: null, measurable: false,
+                   scheduled: 0, worked: 0, target: 0, realHourly: null, verdict: 'Sin calcular' },
+            fuel: { samples: 0, marginal: [], avgMarginal: null, inflection: null, elasticity: null }
+        };
+
+        const usePredictiveModels = (days, metrics, costs, elapsedDays, enabled) => useMemo(() => {
+            /* Sin la pestaña de inteligencia abierta no se paga el costo de 1,000 simulaciones */
+            if (!enabled) return IDLE_PREDICTION;
             const pocketSeries = [];
             const earnedSeries = [];
             days.forEach((day, index) => {
@@ -1234,7 +1247,7 @@
                 cv: mu > 0 ? (sigma / mu) * 100 : 0,
                 enoughData: worked >= 3
             };
-        }, [days, metrics, costs, elapsedDays]);
+        }, [days, metrics, costs, elapsedDays, enabled]);
 
         /* ============================================================================
            6. ICONOGRAFÍA SVG INLINE
@@ -2114,61 +2127,20 @@
                             </p>
                         )}
 
-                        {c.hours > 0 && <ShiftSpeedometer day={day} costs={costs} />}
-
-                        {/* Margen de seguridad de la jornada */}
-                        {c.earned > 0 && (
-                            <div className="flex items-center justify-between gap-2 mb-2.5">
-                                <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">
-                                    Margen de seguridad
-                                </span>
-                                <span className="flex items-center gap-1.5">
-                                    <span className={`text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded border ${
+                        <div className="flex items-center justify-between gap-2 mb-2.5">
+                            <span className="flex items-center gap-1.5 min-w-0">
+                                <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">A la cartera</span>
+                                {c.earned > 0 && (
+                                    <span className={`text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded border shrink-0 ${
                                         c.safetyBand === 'healthy' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/40'
                                         : c.safetyBand === 'caution' ? 'bg-amber-500/10 text-amber-300 border-amber-500/40'
                                         : 'bg-rose-500/10 text-rose-300 border-rose-500/40'}`}>
-                                        {c.safetyBand === 'healthy' ? 'Saludable'
-                                            : c.safetyBand === 'caution' ? 'Precaución' : 'Crítico'}
-                                    </span>
-                                    <span className="text-[13px] font-bold num text-slate-100">{pctText(c.safetyRatio, 0)}</span>
-                                </span>
-                            </div>
-                        )}
-
-                        {/* Punto de equilibrio de la jornada */}
-                        {c.hasData && (
-                            <div className={`flex items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5 mb-2.5 ${
-                                equilibrium.key === 'deficit' ? 'bg-rose-950/25 border-rose-900/50'
-                                : equilibrium.key === 'even' ? 'bg-amber-950/20 border-amber-900/50'
-                                : equilibrium.key === 'profit' ? 'bg-emerald-950/20 border-emerald-900/40'
-                                : 'bg-slate-800/40 border-slate-800'}`}>
-                                <span className={`text-[10px] font-bold uppercase tracking-wider truncate ${
-                                    equilibrium.key === 'deficit' ? 'text-rose-300'
-                                    : equilibrium.key === 'even' ? 'text-amber-300'
-                                    : equilibrium.key === 'profit' ? 'text-emerald-300' : 'text-slate-400'}`}>
-                                    {equilibrium.label}
-                                </span>
-                                <span className="text-[10px] num text-slate-400 shrink-0">
-                                    {equilibrium.key === 'deficit' && `${cash(equilibrium.gap)} ${equilibrium.detail}`}
-                                    {equilibrium.key === 'profit' && `+${cash(equilibrium.gap)} ${equilibrium.detail}`}
-                                    {equilibrium.key === 'even' && equilibrium.detail}
-                                    {equilibrium.key === 'idle' && equilibrium.detail}
-                                </span>
-                            </div>
-                        )}
-
-                        <div className="flex items-center justify-between gap-2 mb-2.5">
-                            <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">A la cartera</span>
-                            <span className="flex items-baseline gap-2">
-                                {c.earned > 0 && (
-                                    <span className={`text-[10px] num font-semibold ${
-                                        c.returnRate >= 70 ? 'text-emerald-500/80' : c.returnRate >= 50 ? 'text-amber-500/80' : 'text-rose-500/80'}`}>
-                                        {pctText(c.returnRate, 0)} a la cartera
+                                        {pctText(c.safetyRatio, 0)}
                                     </span>
                                 )}
-                                <span className={`text-sm font-bold num ${netTone}`}>
-                                    {c.hasData ? cash(c.pocket) : '—'}
-                                </span>
+                            </span>
+                            <span className={`text-sm font-bold num shrink-0 ${netTone}`}>
+                                {c.hasData ? cash(c.pocket) : '—'}
                             </span>
                         </div>
 
@@ -2194,6 +2166,46 @@
 
                         {open && (
                             <div className="mt-2.5 pt-2.5 border-t border-slate-800 space-y-2.5 fade-in">
+                            {c.hours > 0 && <ShiftSpeedometer day={day} costs={costs} />}
+                            {/* Margen de seguridad de la jornada */}
+                            {c.earned > 0 && (
+                                <div className="flex items-center justify-between gap-2 mb-2.5">
+                                    <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">
+                                        Margen de seguridad
+                                    </span>
+                                    <span className="flex items-center gap-1.5">
+                                        <span className={`text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded border ${
+                                            c.safetyBand === 'healthy' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/40'
+                                            : c.safetyBand === 'caution' ? 'bg-amber-500/10 text-amber-300 border-amber-500/40'
+                                            : 'bg-rose-500/10 text-rose-300 border-rose-500/40'}`}>
+                                            {c.safetyBand === 'healthy' ? 'Saludable'
+                                                : c.safetyBand === 'caution' ? 'Precaución' : 'Crítico'}
+                                        </span>
+                                        <span className="text-[13px] font-bold num text-slate-100">{pctText(c.safetyRatio, 0)}</span>
+                                    </span>
+                                </div>
+                            )}
+                            {/* Punto de equilibrio de la jornada */}
+                            {c.hasData && (
+                                <div className={`flex items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5 mb-2.5 ${
+                                    equilibrium.key === 'deficit' ? 'bg-rose-950/25 border-rose-900/50'
+                                    : equilibrium.key === 'even' ? 'bg-amber-950/20 border-amber-900/50'
+                                    : equilibrium.key === 'profit' ? 'bg-emerald-950/20 border-emerald-900/40'
+                                    : 'bg-slate-800/40 border-slate-800'}`}>
+                                    <span className={`text-[10px] font-bold uppercase tracking-wider truncate ${
+                                        equilibrium.key === 'deficit' ? 'text-rose-300'
+                                        : equilibrium.key === 'even' ? 'text-amber-300'
+                                        : equilibrium.key === 'profit' ? 'text-emerald-300' : 'text-slate-400'}`}>
+                                        {equilibrium.label}
+                                    </span>
+                                    <span className="text-[10px] num text-slate-400 shrink-0">
+                                        {equilibrium.key === 'deficit' && `${cash(equilibrium.gap)} ${equilibrium.detail}`}
+                                        {equilibrium.key === 'profit' && `+${cash(equilibrium.gap)} ${equilibrium.detail}`}
+                                        {equilibrium.key === 'even' && equilibrium.detail}
+                                        {equilibrium.key === 'idle' && equilibrium.detail}
+                                    </span>
+                                </div>
+                            )}
                                 <div className="grid grid-cols-2 gap-2">
                                     <MoneyField id={`hours-${day.id}`} label="Horas al volante" tone="unit" prefix="h" compact
                                                 value={day.hours} onChange={set('hours')} />
@@ -4247,6 +4259,124 @@
         }
 
         /* ============================================================================
+           15e-4. BANNER DEL TURNO ACTIVO (cabecera de la pestaña Registro)
+           ============================================================================ */
+        const TodayBanner = memo(function TodayBanner({ day, costs, metrics, monthName, onOpenHud }) {
+            const { cash } = useCash();
+            const c = useMemo(() => (day ? computeDay(day, costs) : null), [day, costs]);
+
+            if (!day) {
+                return (
+                    <div className="bg-slate-900 rounded-2xl border border-slate-800 px-4 py-3">
+                        <p className="text-[11px] uppercase tracking-[0.14em] text-slate-300 font-bold">Sin turno activo</p>
+                        <p className="text-[12px] text-slate-400 mt-1 num">
+                            Estás viendo {monthName}. Vuelve al mes en curso para capturar la jornada de hoy.
+                        </p>
+                    </div>
+                );
+            }
+
+            const missingToGoal = Math.max(c.goal - c.earned, 0);
+
+            return (
+                <div className="bg-slate-900 rounded-2xl border border-slate-800 p-3">
+                    <div className="flex items-center justify-between gap-3 mb-2.5">
+                        <div className="min-w-0">
+                            <p className="text-[10px] uppercase tracking-[0.16em] text-emerald-400 font-bold">Turno de hoy</p>
+                            <p className="text-slate-100 font-bold num text-[15px] truncate">
+                                {day.dateString} · <span className="text-slate-300">{day.dayName}</span>
+                            </p>
+                        </div>
+                        <button onClick={onOpenHud} aria-label="Abrir HUD de cabina"
+                                style={{ minHeight: '54px', minWidth: '54px' }}
+                                className="focus-ring press shrink-0 flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600/15 border border-emerald-600/50 text-emerald-300 px-3 text-[12px] font-bold transition-colors">
+                            <IconGauge size={20} /> HUD
+                        </button>
+                    </div>
+
+                    <div className="grid grid-cols-4 gap-1.5">
+                        <BannerCell label="Meta" value={cash(c.goal, 0)} tone="text-slate-100" />
+                        <BannerCell label="Depositado" value={cash(c.earned, 0)} tone="text-emerald-400" />
+                        <BannerCell label="Gasolina" value={cash(c.gasPaid, 0)} tone="text-rose-300" />
+                        <BannerCell label="Bolsillo" value={cash(c.operatingCashFlow, 0)}
+                                    tone={c.operatingCashFlow >= 0 ? 'text-emerald-400' : 'text-rose-300'} />
+                    </div>
+
+                    <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden mt-2.5">
+                        <div className={`h-1.5 rounded-full transition-all duration-500 ${
+                            c.percentage >= 100 ? 'bg-emerald-500' : c.percentage >= 50 ? 'bg-amber-500' : 'bg-sky-500'}`}
+                             style={{ width: `${Math.min(c.percentage, 100)}%` }}></div>
+                    </div>
+                    <p className="text-[11px] text-slate-400 num mt-1.5">
+                        {missingToGoal > 0
+                            ? <>Faltan <span className="text-slate-100 font-bold">{cash(missingToGoal, 0)}</span> para la meta del día</>
+                            : <span className="text-emerald-400 font-bold">Meta del día liberada</span>}
+                        <span className="text-slate-500"> · mes al {pctText(metrics.goalProgress, 0)}</span>
+                    </p>
+                </div>
+            );
+        });
+
+        const BannerCell = ({ label, value, tone }) => (
+            <div className="rounded-lg bg-slate-800/50 border border-slate-800 px-1.5 py-1.5 text-center">
+                <p className="text-[8.5px] uppercase tracking-wider text-slate-300 font-bold truncate">{label}</p>
+                <p className={`text-[13px] font-bold num ${tone}`}>{value}</p>
+            </div>
+        );
+
+        /* ============================================================================
+           15e-5. BARRA DE PESTAÑAS INFERIOR (thumb zone)
+           ============================================================================ */
+        const TABS = [
+            { id: 'registro', label: 'Registro', accent: 'emerald' },
+            { id: 'cockpit', label: 'Cockpit', accent: 'cyan' },
+            { id: 'inteligencia', label: 'Inteligencia', accent: 'violet' }
+        ];
+
+        const TabIcon = ({ id, size = 22 }) => {
+            if (id === 'registro') {
+                return <Icon size={size} path={<><rect x="4" y="3" width="16" height="18" rx="2" /><line x1="8" y1="8" x2="16" y2="8" /><line x1="8" y1="12" x2="16" y2="12" /><line x1="8" y1="16" x2="13" y2="16" /></>} />;
+            }
+            if (id === 'cockpit') {
+                return <Icon size={size} path={<><path d="M12 15l4-4" /><path d="M3.5 17a9 9 0 1 1 17 0" /><circle cx="12" cy="17" r="1.6" fill="currentColor" stroke="none" /></>} />;
+            }
+            return <Icon size={size} path={<><path d="M12 3a4 4 0 0 0-4 4 3.5 3.5 0 0 0-1.5 6.4A3.5 3.5 0 0 0 9 20a3 3 0 0 0 3-1.6 3 3 0 0 0 3 1.6 3.5 3.5 0 0 0 2.5-6.6A3.5 3.5 0 0 0 16 7a4 4 0 0 0-4-4z" /><line x1="12" y1="7" x2="12" y2="18.4" /></>} />;
+        };
+
+        const BottomTabBar = memo(function BottomTabBar({ tab, onTab, barRef }) {
+            const accents = {
+                emerald: 'text-emerald-300 border-emerald-400',
+                cyan: 'text-cyan-300 border-cyan-400',
+                violet: 'text-violet-300 border-violet-400'
+            };
+            return (
+                <nav ref={barRef} aria-label="Navegación principal"
+                     className="fixed left-0 right-0 bottom-0 z-50 bg-slate-950/97 backdrop-blur border-t border-slate-800"
+                     style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}>
+                    <div className="max-w-2xl mx-auto grid grid-cols-3">
+                        {TABS.map(item => {
+                            const active = tab === item.id;
+                            return (
+                                <button key={item.id} onClick={() => onTab(item.id)}
+                                        aria-current={active ? 'page' : undefined}
+                                        style={{ minHeight: '62px' }}
+                                        className={`focus-ring relative flex flex-col items-center justify-center gap-1 transition-colors ${
+                                            active ? accents[item.accent] : 'text-slate-400'}`}>
+                                    <span className={`absolute top-0 left-1/2 -translate-x-1/2 h-0.5 rounded-full transition-all duration-200 ${
+                                        active ? `w-10 ${item.accent === 'emerald' ? 'bg-emerald-400' : item.accent === 'cyan' ? 'bg-cyan-400' : 'bg-violet-400'}` : 'w-0 bg-transparent'}`}></span>
+                                    <TabIcon id={item.id} size={active ? 23 : 21} />
+                                    <span className={`text-[10px] font-bold tracking-wide ${active ? '' : 'font-semibold'}`}>
+                                        {item.label}
+                                    </span>
+                                </button>
+                            );
+                        })}
+                    </div>
+                </nav>
+            );
+        });
+
+        /* ============================================================================
            15f. DOCK ERGONÓMICO DE UNA MANO (THUMB ZONE)
            Todo lo accionable en marcha vive aquí: en los ~280 px inferiores, con
            objetivos de 56 px o más y separación generosa (ley de Fitts).
@@ -4254,7 +4384,8 @@
         const DIAL_AMOUNTS = [50, 100, 200, 500];
 
         function ThumbDock({
-            dockRef, day, filter, counts, onFilter, onInject, onRest, undoState, onUndo, onOpenHud, disabled
+            dockRef, day, filter, counts, onFilter, onInject, onRest, undoState, onUndo, onOpenHud,
+            disabled, bottomOffset
         }) {
             const { cash } = useCash();
             const [dialOpen, setDialOpen] = useState(false);
@@ -4265,8 +4396,8 @@
 
             return (
                 <div ref={dockRef}
-                     className="fixed left-0 right-0 bottom-0 z-40 bg-slate-950/95 backdrop-blur border-t border-slate-800"
-                     style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}>
+                     className="fixed left-0 right-0 z-40 bg-slate-950/95 backdrop-blur border-t border-slate-800"
+                     style={{ bottom: `calc(${bottomOffset || 62}px + env(safe-area-inset-bottom, 0px))` }}>
 
                     {/* Dial de inyección rápida */}
                     {dialOpen && (
@@ -4331,7 +4462,7 @@
                             <DockChip active={filter === 'todos'} onClick={() => onFilter('todos')} label="Todos" count={counts.todos} accent="slate" />
                             <DockChip active={filter === 'cumplidos'} onClick={() => onFilter('cumplidos')} label="Cumpl." count={counts.cumplidos} accent="emerald" />
                             <DockChip active={filter === 'pendientes'} onClick={() => onFilter('pendientes')} label="Progr." count={counts.pendientes} accent="amber" />
-                            <DockChip active={filter === 'sin'} onClick={() => onFilter('sin')} label="Libres" count={counts.sin} accent="slate" />
+                            <DockChip active={filter === 'sin'} onClick={() => onFilter('sin')} label="Descanso" count={counts.sin} accent="slate" />
                         </div>
                         <button onClick={() => { setDialOpen(o => !o); feedback.tap(); }}
                                 aria-expanded={dialOpen} aria-label="Dial de registro rápido"
@@ -4387,6 +4518,10 @@
             const [shiftOpen, setShiftOpen] = useState(false);
             const [hudOpen, setHudOpen] = useState(false);
             const [ledgerOpen, setLedgerOpen] = useState(false);
+            const [tab, setTab] = useState('registro');
+            /* Las pestañas pesadas se montan la primera vez que se visitan y ya no se
+               desmontan: el cambio posterior es instantáneo y Monte Carlo no se recalcula. */
+            const [mountedTabs, setMountedTabs] = useState({ registro: true, cockpit: false, inteligencia: false });
             const [pickerOpen, setPickerOpen] = useState(false);
             const [toast, setToast] = useState(null);
             const [lastSavedAt, setLastSavedAt] = useState(null);
@@ -4396,11 +4531,13 @@
 
             const [undoState, setUndoState] = useState(null);
             const [dockHeight, setDockHeight] = useState(96);
+            const [tabBarHeight, setTabBarHeight] = useState(62);
 
             const dayRefs = useRef({});
             const toastTimer = useRef(null);
             const headerRef = useRef(null);
             const dockRef = useRef(null);
+            const tabBarRef = useRef(null);
             const listRef = useRef(month.list);   // month ya existe; list se desestructura abajo
             const undoTimer = useRef(null);
             const undoSnapshot = useRef(null);
@@ -4437,7 +4574,10 @@
             useEffect(() => {
                 const measure = () => {
                     if (headerRef.current) setHeaderHeight(headerRef.current.offsetHeight);
-                    if (dockRef.current) setDockHeight(dockRef.current.offsetHeight);
+                    const bar = tabBarRef.current ? tabBarRef.current.offsetHeight : 62;
+                    const dock = dockRef.current ? dockRef.current.offsetHeight : 0;
+                    setTabBarHeight(bar);
+                    setDockHeight(bar + dock);
                 };
                 measure();
                 const raf = requestAnimationFrame(measure);
@@ -4474,7 +4614,8 @@
             const metrics = useFinancialTelemetry(list, costs, elapsedDays, basis);
             const deferredList = useDeferredValue(list);
             const deferredMetrics = useFinancialTelemetry(deferredList, costs, elapsedDays, basis);
-            const prediction = usePredictiveModels(deferredList, deferredMetrics, costs, elapsedDays);
+            const prediction = usePredictiveModels(deferredList, deferredMetrics, costs, elapsedDays,
+                                                   mountedTabs.inteligencia);
 
             /* Muestra de jornadas para la campana de densidad */
             const grossSamples = useMemo(
@@ -4600,6 +4741,19 @@
                 setMeta(prev => ({ ...prev, pacingMode: mode }));
             }, []);
 
+            const goToTab = useCallback((next, options) => {
+                setTab(prev => {
+                    if (prev !== next) {
+                        setMountedTabs(m => (m[next] ? m : { ...m, [next]: true }));
+                        feedback.tap();
+                    }
+                    return next;
+                });
+                if (!options || options.scrollTop !== false) {
+                    window.scrollTo({ top: 0, behavior: 'auto' });
+                }
+            }, []);
+
             const setAccountingBasis = useCallback((next) => {
                 setMeta(prev => ({ ...prev, accountingBasis: next }));
             }, []);
@@ -4654,13 +4808,16 @@
                 haptic(12);
             }, [year, monthIndex, goToMonth]);
 
+            /* Cualquier atajo a un día (heatmap, auditoría, SPC, semana) aterriza en Registro */
             const focusDay = useCallback((dayId) => {
                 setFilter('todos');
+                goToTab('registro', { scrollTop: false });
                 setScrollTarget(dayId);
-            }, []);
+            }, [goToTab]);
 
             const goToToday = useCallback(() => {
                 const now = new Date();
+                goToTab('registro', { scrollTop: false });
                 if (!today.isCurrentMonth) {
                     goToMonth(now.getFullYear(), now.getMonth());
                     setScrollTarget(now.getDate());
@@ -4668,7 +4825,7 @@
                     focusDay(now.getDate());
                 }
                 haptic(15);
-            }, [today.isCurrentMonth, goToMonth, focusDay]);
+            }, [today.isCurrentMonth, goToMonth, focusDay, goToTab]);
 
             useEffect(() => {
                 if (scrollTarget === null) return;
@@ -4677,7 +4834,7 @@
                     if (node && node.scrollIntoView) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
                     else notify('Ese día no existe en el mes visible', 'warn');
                     setScrollTarget(null);
-                }, 90);
+                }, 140);
                 return () => clearTimeout(timer);
             }, [scrollTarget, list, notify]);
 
@@ -5068,10 +5225,54 @@
                         )}
                     </header>
 
-                    <main className="max-w-2xl mx-auto px-3 pt-3 space-y-3"
+                    <main className="max-w-2xl mx-auto px-3 pt-3"
                           style={{ paddingBottom: `${dockHeight + 24}px` }}>
 
-                        {/* ---------- Utilidad neta real ---------- */}
+                        {/* ================= PESTAÑA: REGISTRO ================= */}
+                        <div style={{ display: tab === 'registro' ? 'block' : 'none' }} className="space-y-3">
+                            <TodayBanner day={todayDay} costs={costs} metrics={metrics}
+                                         monthName={monthLabel(year, monthIndex)}
+                                         onOpenHud={() => { setHudOpen(true); feedback.tap(); }} />
+<div className="flex items-center justify-between gap-2 pt-1">
+                            <h2 className="text-slate-100 text-sm font-semibold tracking-tight">Jornadas</h2>
+                            <span className="text-[11px] text-slate-400 num">
+                                {visibleDays.length} de {counts.todos} días
+                                {filter !== 'todos' ? ' · filtrado' : ''}
+                            </span>
+                        </div>
+
+                        {/* ---------- Jornadas ---------- */}
+                        <section className="space-y-2.5">
+                            {visibleDays.length === 0 ? (
+                                <div className="bg-slate-900 border border-dashed border-slate-700 rounded-xl p-8 text-center">
+                                    <p className="text-slate-300 text-sm font-semibold">Sin días en este filtro</p>
+                                    <p className="text-slate-500 text-[12px] mt-1">Cambia el filtro para ver el resto del mes.</p>
+                                </div>
+                            ) : visibleDays.map(day => (
+                                <DayCard key={`${year}-${monthIndex}-${day.id}`}
+                                         day={day}
+                                         costs={costs}
+                                         isToday={day.id === today.id}
+                                         ucl={deferredMetrics.spc.ucl}
+                                         lcl={deferredMetrics.spc.lcl}
+                                         spcSamples={deferredMetrics.spc.n}
+                                         avgGasPerKm={deferredMetrics.avgGasPerKm}
+                                         onField={handleField}
+                                         onAutoGoal={handleAutoGoal}
+                                         onRestDay={handleRestDay}
+                                         ref={(node) => { dayRefs.current[day.id] = node; }} />
+                            ))}
+                        </section>
+
+                        <p className="text-center text-[10px] text-slate-600 pt-2 num">
+                            {monthLabel(year, monthIndex)} · guardado en didi_data_{year}_{String(monthIndex + 1).padStart(2, '0')}
+                        </p>
+                        </div>
+
+                        {/* ================= PESTAÑA: COCKPIT ================= */}
+                        {mountedTabs.cockpit && (
+                        <div style={{ display: tab === 'cockpit' ? 'block' : 'none' }} className="space-y-3">
+                            {/* ---------- Utilidad neta real ---------- */}
                         <section className="bg-slate-900 rounded-2xl border border-slate-800 p-4">
                             <div className="flex items-start justify-between gap-3">
                                 <div className="min-w-0">
@@ -5129,9 +5330,9 @@
                             <div className="grid grid-cols-3 gap-2 mt-3">
                                 <CostChip label="Gasolina" value={cash(metrics.totalGas, 0)} color="text-rose-300"
                                           pct={metrics.fuelRetention} />
-                                <CostChip label="Ruta en efectivo" value={cash(metrics.totalRouteCash, 0)} color="text-amber-300"
+                                <CostChip label="Ruta" value={cash(metrics.totalRouteCash, 0)} color="text-amber-300"
                                           pct={metrics.routeRatio} />
-                                <CostChip label="Queda en cartera" value={cash(metrics.pocketProfit, 0)} color="text-emerald-400"
+                                <CostChip label="Cartera" value={cash(metrics.pocketProfit, 0)} color="text-emerald-400"
                                           pct={metrics.returnRate} />
                             </div>
 
@@ -5233,7 +5434,7 @@
                                         sub={metrics.totalKm > 0 ? `${money(metrics.totalKm, 0)} km recorridos` : 'Captura km en el detalle'} />
                         </section>
 
-                        <IncomeStatementPanel metrics={metrics} basis={basis} onBasis={setAccountingBasis} />
+                            <IncomeStatementPanel metrics={metrics} basis={basis} onBasis={setAccountingBasis} />
 
                         <VariancePanel metrics={metrics} />
 
@@ -5246,15 +5447,20 @@
                                              mode={meta.pacingMode === 'record' ? 'record' : 'relief'}
                                              onMode={setPacingMode} />
 
-                        <PredictivePanel prediction={prediction} metrics={deferredMetrics}
+                            <CumulativeChart days={deferredList} metrics={deferredMetrics}
+                                         todayIndex={today.index} prediction={prediction} />
+                        </div>
+                        )}
+
+                        {/* ================= PESTAÑA: INTELIGENCIA ================= */}
+                        {mountedTabs.inteligencia && (
+                        <div style={{ display: tab === 'inteligencia' ? 'block' : 'none' }} className="space-y-3">
+                            <PredictivePanel prediction={prediction} metrics={deferredMetrics}
                                          samples={grossSamples} targetDaily={targetDaily} />
 
                         <WhatIfPanel metrics={deferredMetrics} />
 
-                        <CumulativeChart days={deferredList} metrics={deferredMetrics}
-                                         todayIndex={today.index} prediction={prediction} />
-
-                        <ProductivityHeatmap days={deferredList} computed={deferredMetrics.computed}
+                            <ProductivityHeatmap days={deferredList} computed={deferredMetrics.computed}
                                              year={year} monthIndex={monthIndex}
                                              todayId={today.id} onPickDay={focusDay} />
 
@@ -5262,39 +5468,10 @@
                                             bestWeekday={deferredMetrics.bestWeekday} />
 
                         <SpcPanel spc={deferredMetrics.spc} outliers={outliers} onPickDay={focusDay} />
-
-                        <div className="flex items-center justify-between gap-2 pt-1">
-                            <h2 className="text-slate-100 text-sm font-semibold tracking-tight">Jornadas</h2>
-                            <span className="text-[11px] text-slate-400 num">
-                                {visibleDays.length} de {counts.todos} días
-                                {filter !== 'todos' ? ' · filtrado' : ''}
-                            </span>
                         </div>
+                        )}
 
-                        {/* ---------- Jornadas ---------- */}
-                        <section className="space-y-2.5">
-                            {visibleDays.length === 0 ? (
-                                <div className="bg-slate-900 border border-dashed border-slate-700 rounded-xl p-8 text-center">
-                                    <p className="text-slate-300 text-sm font-semibold">Sin días en este filtro</p>
-                                    <p className="text-slate-500 text-[12px] mt-1">Cambia el filtro para ver el resto del mes.</p>
-                                </div>
-                            ) : visibleDays.map(day => (
-                                <DayCard key={`${year}-${monthIndex}-${day.id}`}
-                                         day={day}
-                                         costs={costs}
-                                         isToday={day.id === today.id}
-                                         ucl={deferredMetrics.spc.ucl}
-                                         lcl={deferredMetrics.spc.lcl}
-                                         spcSamples={deferredMetrics.spc.n}
-                                         avgGasPerKm={deferredMetrics.avgGasPerKm}
-                                         onField={handleField}
-                                         onAutoGoal={handleAutoGoal}
-                                         onRestDay={handleRestDay}
-                                         ref={(node) => { dayRefs.current[day.id] = node; }} />
-                            ))}
-                        </section>
-
-                        <p className="text-center text-[10px] text-slate-600 pt-2 num">
+                        <p className="text-center text-[10px] text-slate-500 pt-4 num">
                             {monthLabel(year, monthIndex)} · guardado en didi_data_{year}_{String(monthIndex + 1).padStart(2, '0')}
                         </p>
                     </main>
@@ -5325,8 +5502,12 @@
                             if (next) feedback.confirm();
                         }} />
 
+                    <BottomTabBar tab={tab} onTab={goToTab} barRef={tabBarRef} />
+
+                    {tab === 'registro' && (
                     <ThumbDock
                         dockRef={dockRef}
+                        bottomOffset={tabBarHeight}
                         day={todayDay}
                         disabled={!todayDay}
                         filter={filter}
@@ -5337,6 +5518,7 @@
                         undoState={undoState}
                         onUndo={undoLast}
                         onOpenHud={() => { setHudOpen(true); feedback.tap(); }} />
+                    )}
 
                     <LedgerSheet
                         open={ledgerOpen}
@@ -5364,7 +5546,7 @@
 
                     {toast && (
                         <div className="fixed left-0 right-0 z-[60] flex justify-center px-4 pointer-events-none"
-                             style={{ bottom: `calc(${dockHeight + 12}px + env(safe-area-inset-bottom, 0px))` }}
+                             style={{ bottom: `calc(${dockHeight + 14}px + env(safe-area-inset-bottom, 0px))` }}
                              role="status" aria-live="polite">
                             <div className={`sheet-in flex items-center gap-2 rounded-xl border px-3.5 py-2.5 text-[12px] font-semibold shadow-lg ${
                                 toast.tone === 'warn'
