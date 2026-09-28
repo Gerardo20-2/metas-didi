@@ -115,6 +115,10 @@
         const NUMERIC_FIELDS = ['goal', 'earned', 'gas', 'hours', 'km', 'tolls', 'wash', 'misc',
                                 'cashCollected', 'appDeposit'];
 
+        /* Campos del tablero DiDi + odómetro. `timeOnline` y `timeActive` admiten minutos
+           ("450") o formato reloj ("7:30"), por eso no pasan por el saneamiento monetario. */
+        const OPS_FIELDS = ['kmStart', 'kmEnd', 'kmDidi', 'timeOnline', 'timeActive', 'trips'];
+
         const COLORS = {
             emerald: '#10b981',
             amber: '#f59e0b',
@@ -149,6 +153,43 @@
             const safeInt = (intPart || '').slice(0, 7);
             if (decPart === undefined) return safeInt;
             return safeInt + '.' + decPart.slice(0, 2);
+        };
+
+        /* Enteros sin decimales (conteo de viajes) */
+        const sanitizeInt = (raw) => String(raw === null || raw === undefined ? '' : raw)
+            .replace(/[^0-9]/g, '').slice(0, 5);
+
+        /* Duración: minutos ("450") o reloj ("7:30"). Un solo separador, a lo más 2 dígitos de minutos. */
+        const sanitizeDuration = (raw) => {
+            const value = String(raw === null || raw === undefined ? '' : raw)
+                .replace(/[.hH]/g, ':')
+                .replace(/[^0-9:]/g, '');
+            const [head, ...rest] = value.split(':');
+            if (rest.length === 0) return head.slice(0, 4);
+            return head.slice(0, 2) + ':' + rest.join('').slice(0, 2);
+        };
+
+        /* Convierte la duración capturada a minutos; null si está vacía o es inválida */
+        const parseDuration = (value) => {
+            const text = String(value === null || value === undefined ? '' : value).trim();
+            if (!text) return null;
+            if (text.includes(':')) {
+                const [h, m] = text.split(':');
+                const hours = Number(h || 0);
+                const minutes = Number(m || 0);
+                if (!Number.isFinite(hours) || !Number.isFinite(minutes) || minutes >= 60) return null;
+                const total = hours * 60 + minutes;
+                return total > 0 ? total : null;
+            }
+            const minutes = Number(text);
+            return Number.isFinite(minutes) && minutes > 0 ? minutes : null;
+        };
+
+        const durationText = (minutes) => {
+            if (minutes === null || minutes === undefined || !Number.isFinite(minutes)) return '—';
+            const h = Math.floor(minutes / 60);
+            const m = Math.round(minutes - h * 60);
+            return `${h} h ${String(m).padStart(2, '0')} min`;
         };
 
         const money = (value, decimals = 2) => num(value).toLocaleString('es-MX', {
@@ -338,7 +379,10 @@
                     wash: '',
                     misc: '',
                     cashCollected: '',   // efectivo cobrado en mano
-                    appDeposit: ''       // saldo liquidado por la billetera de la app
+                    appDeposit: '',      // saldo liquidado por la billetera de la app
+                    /* Tablero DiDi y odómetro */
+                    kmStart: '', kmEnd: '', kmDidi: '',
+                    timeOnline: '', timeActive: '', trips: ''
                 };
             });
         };
@@ -358,13 +402,14 @@
                     dateString: `${id}`,
                     dayName: '',
                     goal: 0, earned: '', gas: '', hours: '', km: '', tolls: '', wash: '', misc: '',
-                    cashCollected: '', appDeposit: ''
+                    cashCollected: '', appDeposit: '',
+                    kmStart: '', kmEnd: '', kmDidi: '', timeOnline: '', timeActive: '', trips: ''
                 };
                 const merged = { ...template, ...entry, id: id };
                 merged.dateString = entry.dateString || template.dateString;
                 merged.dayName = entry.dayName || template.dayName;
                 merged.goal = entry.goal === undefined || entry.goal === null ? template.goal : entry.goal;
-                NUMERIC_FIELDS.forEach(field => {
+                [...NUMERIC_FIELDS, ...OPS_FIELDS].forEach(field => {
                     if (field === 'goal') return;
                     const value = entry[field];
                     merged[field] = value === undefined || value === null ? '' : value;
@@ -818,6 +863,226 @@
                 cashPerKm: totalKm > 0 ? totalCashOut / totalKm : null,
                 avgGasPerKm, spc, variance, weeks, auditFlags
             };
+        };
+
+        /* ============================================================================
+           5a. MOTOR DE ANALÍTICA OPERATIVA (tablero DiDi + odómetro)
+           ----------------------------------------------------------------------------
+           km_total   = km_fin − km_inicio            (respaldo: campo "Kilómetros")
+           η_km       = km_didi / km_total             aprovechamiento del rodado
+           η_t        = t_activo / t_conectado         ocupación del turno
+           G_didi     = gasolina × η_km                gasolina prorrateada al servicio
+           MN         = ingreso − G_didi               margen neto operativo
+           R_km       = MN / km_didi                   R_hr = MN / (t_conectado / 60)
+           EPV        = ingreso / viajes               ticket promedio efectivo
+           IRD        = 100 × Σ wᵢ·xᵢ / Σ wᵢ           pesos 0.40 · 0.35 · 0.15 · 0.10
+           ============================================================================ */
+        const IRD_WEIGHTS = { rKm: 0.40, rHr: 0.35, etaT: 0.15, etaKm: 0.10 };
+
+        const OperationalAnalytics = {
+            calcDailyMetrics(day) {
+                const earned = num(day.earned);
+                const gas = num(day.gas);
+                const kmStart = num(day.kmStart);
+                const kmEnd = num(day.kmEnd);
+                const kmDidi = num(day.kmDidi);
+                const trips = num(day.trips);
+
+                /* Rodado total: odómetro si es coherente; si no, el campo "Kilómetros" */
+                const odometerOk = hasValue(day.kmStart) && hasValue(day.kmEnd) && kmEnd > kmStart;
+                const odometerError = hasValue(day.kmStart) && hasValue(day.kmEnd) && kmEnd <= kmStart;
+                const kmTotal = odometerOk ? kmEnd - kmStart : (num(day.km) > 0 ? num(day.km) : null);
+                const kmSource = odometerOk ? 'odometro' : kmTotal !== null ? 'manual' : null;
+
+                /* DiDi no puede reportar más km de los que rodó el auto: se acota y se avisa */
+                const kmOverflow = kmTotal !== null && kmDidi > kmTotal;
+                const etaKm = kmTotal !== null && kmDidi > 0 ? Math.min(kmDidi / kmTotal, 1) : null;
+                const deadKm = kmTotal !== null && kmDidi > 0 ? Math.max(kmTotal - kmDidi, 0) : null;
+
+                /* Tiempo conectado: tablero DiDi; respaldo, las horas al volante */
+                const onlineCaptured = parseDuration(day.timeOnline);
+                const online = onlineCaptured !== null ? onlineCaptured
+                    : (num(day.hours) > 0 ? num(day.hours) * 60 : null);
+                const active = parseDuration(day.timeActive);
+                const timeOverflow = online !== null && active !== null && active > online;
+                const etaT = online !== null && active !== null ? Math.min(active / online, 1) : null;
+
+                /* Sin η_km toda la gasolina se imputa al servicio (criterio conservador) */
+                const gasDidi = etaKm !== null ? gas * etaKm : gas;
+                const gasPersonal = gas - gasDidi;
+                const margin = earned - gasDidi;
+
+                const rKm = kmDidi > 0 ? margin / kmDidi : null;
+                const rHr = online !== null ? margin / (online / 60) : null;
+                const epv = trips > 0 ? earned / trips : null;
+                const tripsPerHour = trips > 0 && online !== null ? trips / (online / 60) : null;
+
+                return {
+                    earned, gas, kmStart, kmEnd, kmDidi, trips,
+                    kmTotal, kmSource, odometerError, kmOverflow, deadKm, etaKm,
+                    online, onlineFromHours: onlineCaptured === null && online !== null,
+                    active, timeOverflow, etaT,
+                    gasDidi, gasPersonal, gasProrated: etaKm !== null,
+                    margin, rKm, rHr, epv, tripsPerHour,
+                    worked: earned > 0,
+                    hasOps: kmDidi > 0 || onlineCaptured !== null || active !== null || trips > 0 || odometerOk
+                };
+            },
+
+            /* Normalización contra el mejor valor del mes: x = valor / máximo, acotado a [0, 1].
+               Un día con el 90% del mejor $/km obtiene 0.9, no 0 como en min-max. */
+            normalizer(allMetrics, key) {
+                const values = allMetrics.filter(m => m.worked && m[key] !== null).map(m => m[key]);
+                const best = values.length > 0 ? Math.max(...values) : null;
+                return (value) => {
+                    if (value === null || best === null) return null;
+                    if (best <= 0) return 0;   // ningún día con margen positivo
+                    return clamp(value / best, 0, 1);
+                };
+            },
+
+            calcIRD(dayMetrics, allMetrics, norms) {
+                if (!dayMetrics.worked) return null;
+                const n = norms || {
+                    rKm: this.normalizer(allMetrics, 'rKm'),
+                    rHr: this.normalizer(allMetrics, 'rHr')
+                };
+                const parts = {
+                    rKm: n.rKm(dayMetrics.rKm),
+                    rHr: n.rHr(dayMetrics.rHr),
+                    etaT: dayMetrics.etaT,
+                    etaKm: dayMetrics.etaKm
+                };
+                let weighted = 0, weights = 0, used = 0;
+                Object.keys(IRD_WEIGHTS).forEach(key => {
+                    if (parts[key] === null || parts[key] === undefined) return;
+                    weighted += IRD_WEIGHTS[key] * parts[key];
+                    weights += IRD_WEIGHTS[key];
+                    used += 1;
+                });
+                /* Sin ningún indicador de rendimiento ($/km o $/hr) no hay puntaje defendible */
+                if (parts.rKm === null && parts.rHr === null) return null;
+                return {
+                    score: Math.round((weighted / weights) * 100),
+                    parts, components: used, partial: used < 4
+                };
+            },
+
+            calcMonth(days) {
+                const daily = days.map(day => this.calcDailyMetrics(day));
+                const norms = { rKm: this.normalizer(daily, 'rKm'), rHr: this.normalizer(daily, 'rHr') };
+                const ird = daily.map(m => this.calcIRD(m, daily, norms));
+                const irdById = {};
+                days.forEach((day, i) => { irdById[day.id] = ird[i]; });
+                return { daily, ird, irdById, aggregates: this.calcWeeklyAndMonthlyAggregates(days, daily, ird) };
+            },
+
+            calcWeeklyAndMonthlyAggregates(days, daily, ird) {
+                const blank = () => ({
+                    count: 0, margin: 0, earned: 0,
+                    marginKm: 0, kmDidi: 0, marginHr: 0, minutes: 0,
+                    kmTotal: 0, kmDidiOdo: 0, dead: 0,
+                    active: 0, onlineT: 0, irdSum: 0, irdCount: 0, trips: 0, tripsEarned: 0
+                });
+                const add = (acc, m, r) => {
+                    acc.count += 1;
+                    acc.margin += m.margin;
+                    acc.earned += m.earned;
+                    if (m.rKm !== null) { acc.marginKm += m.margin; acc.kmDidi += m.kmDidi; }
+                    if (m.rHr !== null) { acc.marginHr += m.margin; acc.minutes += m.online; }
+                    if (m.etaKm !== null) { acc.kmTotal += m.kmTotal; acc.kmDidiOdo += Math.min(m.kmDidi, m.kmTotal); acc.dead += m.deadKm; }
+                    if (m.etaT !== null) { acc.active += Math.min(m.active, m.online); acc.onlineT += m.online; }
+                    if (m.trips > 0) { acc.trips += m.trips; acc.tripsEarned += m.earned; }
+                    if (r) { acc.irdSum += r.score; acc.irdCount += 1; }
+                };
+                /* Promedios ponderados: Σ margen / Σ recurso, robustos ante jornadas cortas */
+                const finish = (acc) => ({
+                    count: acc.count,
+                    margin: acc.margin,
+                    earned: acc.earned,
+                    rKm: acc.kmDidi > 0 ? acc.marginKm / acc.kmDidi : null,
+                    rHr: acc.minutes > 0 ? acc.marginHr / (acc.minutes / 60) : null,
+                    etaKm: acc.kmTotal > 0 ? acc.kmDidiOdo / acc.kmTotal : null,
+                    deadRatio: acc.kmTotal > 0 ? acc.dead / acc.kmTotal : null,
+                    deadKm: acc.dead,
+                    etaT: acc.onlineT > 0 ? acc.active / acc.onlineT : null,
+                    epv: acc.trips > 0 ? acc.tripsEarned / acc.trips : null,
+                    trips: acc.trips,
+                    ird: acc.irdCount > 0 ? acc.irdSum / acc.irdCount : null
+                });
+
+                /* --- Perfil por día de la semana (lunes a domingo) --- */
+                const byWeekday = {};
+                WEEK_ORDER.forEach(wd => { byWeekday[wd] = blank(); });
+                const month = blank();
+                days.forEach((day, i) => {
+                    const m = daily[i];
+                    if (!m.worked) return;
+                    add(month, m, ird[i]);
+                    const wd = DAYS_OF_WEEK.indexOf(day.dayName);
+                    if (wd >= 0) add(byWeekday[wd], m, ird[i]);
+                });
+                const weekdays = WEEK_ORDER.map(wd => ({
+                    weekday: wd, label: DAY_SHORT[wd], name: DAYS_OF_WEEK[wd], ...finish(byWeekday[wd])
+                }));
+                const pick = (key, dir) => weekdays.reduce((best, w) => {
+                    if (w.count === 0 || w[key] === null) return best;
+                    if (!best) return w;
+                    return dir > 0 ? (w[key] > best[key] ? w : best) : (w[key] < best[key] ? w : best);
+                }, null);
+
+                /* --- Semanas calendario (lunes a domingo) y variación WoW --- */
+                const weeks = [];
+                let current = null;
+                days.forEach((day, i) => {
+                    if (!current || DAYS_OF_WEEK.indexOf(day.dayName) === 1) {
+                        current = { index: weeks.length + 1, from: day.dateString, to: day.dateString, acc: blank() };
+                        weeks.push(current);
+                    }
+                    current.to = day.dateString;
+                    if (daily[i].worked) add(current.acc, daily[i], ird[i]);
+                });
+                const delta = (cur, prev) => (cur === null || prev === null || prev === 0
+                    ? null : ((cur - prev) / Math.abs(prev)) * 100);
+                let previous = null;
+                const weekly = weeks.map(week => {
+                    const stats = finish(week.acc);
+                    const row = {
+                        index: week.index, from: week.from, to: week.to, ...stats,
+                        wowMargin: previous ? delta(stats.margin, previous.margin) : null,
+                        wowRKm: previous ? delta(stats.rKm, previous.rKm) : null,
+                        wowRHr: previous ? delta(stats.rHr, previous.rHr) : null
+                    };
+                    if (stats.count > 0) previous = stats;
+                    return row;
+                }).filter(w => w.count > 0);
+
+                /* --- Día estrella: argmax(IRD) --- */
+                let starIndex = -1;
+                ird.forEach((r, i) => {
+                    if (r && (starIndex < 0 || r.score > ird[starIndex].score
+                        || (r.score === ird[starIndex].score && daily[i].margin > daily[starIndex].margin))) {
+                        starIndex = i;
+                    }
+                });
+                const star = starIndex >= 0 ? {
+                    id: days[starIndex].id,
+                    label: days[starIndex].dateString,
+                    dayName: days[starIndex].dayName,
+                    ird: ird[starIndex],
+                    metrics: daily[starIndex]
+                } : null;
+
+                return {
+                    month: finish(month),
+                    weekdays,
+                    bestHourlyWeekday: pick('rHr', 1),
+                    bestKmWeekday: pick('rKm', 1),
+                    worstDeadWeekday: pick('deadRatio', 1),
+                    weekly,
+                    star
+                };
+            }
         };
 
         /* ============================================================================
@@ -1356,7 +1621,8 @@
             </section>
         );
 
-        const MoneyField = ({ id, label, value, onChange, tone, prefix = '$', compact }) => {
+        const MoneyField = ({ id, label, value, onChange, tone, prefix = '$', compact,
+                              sanitize = sanitizeMoney, inputMode = 'decimal', placeholder = '0' }) => {
             const tones = {
                 goal:   { label: 'text-slate-400',  box: 'bg-slate-800/70 border-slate-700 text-slate-200 focus:border-slate-500' },
                 earned: { label: 'text-emerald-400', box: 'bg-emerald-950/30 border-emerald-800/60 text-emerald-100 font-bold focus:border-emerald-500' },
@@ -1375,13 +1641,13 @@
                         <input
                             id={id}
                             type="text"
-                            inputMode="decimal"
+                            inputMode={inputMode}
                             autoComplete="off"
                             spellCheck="false"
                             value={value === null || value === undefined ? '' : String(value)}
-                            onChange={(e) => onChange(sanitizeMoney(e.target.value))}
-                            onBlur={(e) => onChange(sanitizeMoney(e.target.value))}
-                            placeholder="0"
+                            onChange={(e) => onChange(sanitize(e.target.value))}
+                            onBlur={(e) => onChange(sanitize(e.target.value))}
+                            placeholder={placeholder}
                             className={`num w-full border rounded-lg ${compact ? 'py-1.5' : 'py-2'} ${prefix ? 'pl-5' : 'pl-2'} pr-2 text-sm transition-colors focus:outline-none focus:ring-1 focus:ring-slate-600 ${t.box}`}
                         />
                     </div>
@@ -1836,6 +2102,182 @@
         }
 
         /* ============================================================================
+           10b. TABLERO DE INTELIGENCIA OPERATIVA (IRD, eficiencia y perfil semanal)
+           ============================================================================ */
+        function OperationalIntelPanel({ aggregates, onPickDay }) {
+            const { cash } = useCash();
+            const [open, setOpen] = useState(false);
+            const { star, month, weekdays, weekly, bestHourlyWeekday, worstDeadWeekday } = aggregates;
+            const pct = (v) => (v === null ? '—' : pctText(v * 100, 0));
+            const perUnit = (v, unit) => (v === null ? '—' : `${cash(v, 1)}${unit}`);
+            const deltaText = (v) => (v === null ? '—' : `${v >= 0 ? '▲' : '▼'} ${pctText(Math.abs(v), 0)}`);
+            const deltaTone = (v) => (v === null ? 'text-slate-500' : v >= 0 ? 'text-emerald-400' : 'text-rose-400');
+
+            return (
+                <section className="bg-slate-900 rounded-2xl border border-slate-800">
+                    <button onClick={() => { setOpen(o => !o); haptic(10); }} aria-expanded={open}
+                            className="focus-ring press w-full flex items-center justify-between gap-3 p-4 text-left">
+                        <span className="min-w-0">
+                            <span className="block text-slate-100 text-sm font-semibold tracking-tight">Tablero de Inteligencia Operativa</span>
+                            <span className="block text-slate-500 text-[11px] mt-0.5">
+                                {star ? `Día estrella: ${star.label} · Score ${star.ird.score}/100` : 'Captura el tablero DiDi en tus jornadas'}
+                            </span>
+                        </span>
+                        <span className={`text-slate-400 transition-transform ${open ? 'rotate-180' : ''}`}><IconChevronD size={18} /></span>
+                    </button>
+
+                    {open && (
+                        <div className="px-4 pb-4 space-y-3 fade-in">
+                            {/* Card 1: Día de mayor rentabilidad */}
+                            <div className="rounded-xl border border-emerald-900/50 bg-emerald-950/15 p-3">
+                                <p className="text-[9px] uppercase tracking-[0.14em] font-bold text-emerald-300 mb-1.5">Día de mayor rentabilidad</p>
+                                {star ? (
+                                    <button onClick={() => onPickDay(star.id)} className="focus-ring w-full text-left">
+                                        <div className="flex items-baseline justify-between gap-2">
+                                            <span className="text-slate-100 font-bold text-base num">★ {star.label} <span className="text-slate-400 text-[11px] font-semibold">{star.dayName}</span></span>
+                                            <span className="text-emerald-300 font-bold text-lg num">{star.ird.score}<span className="text-[11px] text-slate-400">/100</span></span>
+                                        </div>
+                                        <div className="grid grid-cols-3 gap-2 mt-2 text-center">
+                                            <div>
+                                                <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">$/km neto</p>
+                                                <p className="text-[13px] font-bold num text-slate-100">{perUnit(star.metrics.rKm, '')}</p>
+                                            </div>
+                                            <div>
+                                                <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">$/hr neto</p>
+                                                <p className="text-[13px] font-bold num text-slate-100">{perUnit(star.metrics.rHr, '')}</p>
+                                            </div>
+                                            <div>
+                                                <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">Horas</p>
+                                                <p className="text-[13px] font-bold num text-slate-100">{star.metrics.online !== null ? money(star.metrics.online / 60, 1) : '—'}</p>
+                                            </div>
+                                        </div>
+                                        {star.ird.partial && (
+                                            <p className="text-[9px] text-slate-500 mt-1.5">* Score con {star.ird.components} de 4 indicadores: faltan datos del tablero DiDi.</p>
+                                        )}
+                                    </button>
+                                ) : (
+                                    <p className="text-[11px] text-slate-500">Aún no hay jornadas con ingreso y km DiDi u horas conectado.</p>
+                                )}
+                            </div>
+
+                            {/* Card 2: Eficiencia de flota */}
+                            <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                                <p className="text-[9px] uppercase tracking-[0.14em] font-bold text-sky-300 mb-2">Eficiencia de flota · promedio mensual</p>
+                                <div className="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <div className="flex items-baseline justify-between">
+                                            <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">Km útiles</span>
+                                            <span className="text-[13px] font-bold num text-slate-100">{pct(month.etaKm)}</span>
+                                        </div>
+                                        <div className="w-full bg-slate-800 rounded-full h-1.5 mt-1 overflow-hidden">
+                                            <div className="bg-sky-500 h-1.5 rounded-full" style={{ width: `${clamp((month.etaKm || 0) * 100, 0, 100)}%` }}></div>
+                                        </div>
+                                        <p className="text-[9px] text-slate-500 num mt-1">{month.etaKm !== null ? `${money(month.deadKm, 0)} km fantasma` : 'Sin odómetro + km DiDi'}</p>
+                                    </div>
+                                    <div>
+                                        <div className="flex items-baseline justify-between">
+                                            <span className="text-[10px] uppercase tracking-wider text-slate-300 font-bold">Tiempo activo</span>
+                                            <span className="text-[13px] font-bold num text-slate-100">{pct(month.etaT)}</span>
+                                        </div>
+                                        <div className="w-full bg-slate-800 rounded-full h-1.5 mt-1 overflow-hidden">
+                                            <div className="bg-emerald-500 h-1.5 rounded-full" style={{ width: `${clamp((month.etaT || 0) * 100, 0, 100)}%` }}></div>
+                                        </div>
+                                        <p className="text-[9px] text-slate-500 num mt-1">{month.etaT !== null ? 'Resto: espera de viajes' : 'Sin tiempo conectado + activo'}</p>
+                                    </div>
+                                </div>
+                                <div className="grid grid-cols-3 gap-2 mt-2.5 pt-2.5 border-t border-slate-800 text-center">
+                                    <div>
+                                        <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">$/km neto</p>
+                                        <p className="text-[12px] font-bold num text-slate-100">{perUnit(month.rKm, '')}</p>
+                                    </div>
+                                    <div>
+                                        <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">$/hr neto</p>
+                                        <p className="text-[12px] font-bold num text-slate-100">{perUnit(month.rHr, '')}</p>
+                                    </div>
+                                    <div>
+                                        <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">Ticket EPV</p>
+                                        <p className="text-[12px] font-bold num text-slate-100">{month.epv !== null ? cash(month.epv) : '—'}</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Card 3: Perfil por día de la semana */}
+                            <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                                <p className="text-[9px] uppercase tracking-[0.14em] font-bold text-amber-300 mb-2">Perfil por día de la semana</p>
+                                <table className="w-full text-[11px] num">
+                                    <thead>
+                                        <tr className="text-[9px] uppercase tracking-wider text-slate-400">
+                                            <th className="text-left font-bold pb-1">Día</th>
+                                            <th className="text-right font-bold pb-1">$/km</th>
+                                            <th className="text-right font-bold pb-1">$/hr</th>
+                                            <th className="text-right font-bold pb-1">Km muertos</th>
+                                            <th className="text-right font-bold pb-1">IRD</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {weekdays.map(w => {
+                                            const bestHr = bestHourlyWeekday && bestHourlyWeekday.weekday === w.weekday;
+                                            const worstDead = worstDeadWeekday && worstDeadWeekday.weekday === w.weekday;
+                                            return (
+                                                <tr key={w.weekday} className={`border-t border-slate-800/70 ${w.count === 0 ? 'text-slate-600' : 'text-slate-200'}`}>
+                                                    <td className="py-1 font-semibold">{w.label}<span className="text-slate-500 text-[9px]"> ×{w.count}</span></td>
+                                                    <td className="py-1 text-right">{perUnit(w.rKm, '')}</td>
+                                                    <td className={`py-1 text-right ${bestHr ? 'text-emerald-400 font-bold' : ''}`}>{perUnit(w.rHr, '')}</td>
+                                                    <td className={`py-1 text-right ${worstDead ? 'text-rose-400 font-bold' : ''}`}>{pct(w.deadRatio)}</td>
+                                                    <td className="py-1 text-right">{w.ird !== null ? Math.round(w.ird) : '—'}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                                {(bestHourlyWeekday || worstDeadWeekday) && (
+                                    <p className="text-[10px] text-slate-400 mt-2 pt-2 border-t border-slate-800">
+                                        {bestHourlyWeekday && <>Mayor $/hr neto: <span className="text-emerald-400 font-semibold">{bestHourlyWeekday.name}</span>. </>}
+                                        {worstDeadWeekday && <>Más km fantasma: <span className="text-rose-400 font-semibold">{worstDeadWeekday.name}</span> ({pct(worstDeadWeekday.deadRatio)}).</>}
+                                    </p>
+                                )}
+                            </div>
+
+                            {/* Comparativo semana contra semana */}
+                            {weekly.length > 0 && (
+                                <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                                    <p className="text-[9px] uppercase tracking-[0.14em] font-bold text-slate-300 mb-2">Semana contra semana (WoW)</p>
+                                    <table className="w-full text-[11px] num">
+                                        <thead>
+                                            <tr className="text-[9px] uppercase tracking-wider text-slate-400">
+                                                <th className="text-left font-bold pb-1">Semana</th>
+                                                <th className="text-right font-bold pb-1">Margen</th>
+                                                <th className="text-right font-bold pb-1">WoW</th>
+                                                <th className="text-right font-bold pb-1">$/km</th>
+                                                <th className="text-right font-bold pb-1">WoW</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {weekly.map(w => (
+                                                <tr key={w.index} className="border-t border-slate-800/70 text-slate-200">
+                                                    <td className="py-1 font-semibold">{w.from}–{w.to.split(' ')[0]}</td>
+                                                    <td className="py-1 text-right">{cash(w.margin, 0)}</td>
+                                                    <td className={`py-1 text-right font-bold ${deltaTone(w.wowMargin)}`}>{deltaText(w.wowMargin)}</td>
+                                                    <td className="py-1 text-right">{perUnit(w.rKm, '')}</td>
+                                                    <td className={`py-1 text-right font-bold ${deltaTone(w.wowRKm)}`}>{deltaText(w.wowRKm)}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+
+                            <p className="text-[9px] text-slate-500 leading-relaxed">
+                                IRD = 40% $/km neto + 35% $/hr neto (ambos contra el mejor día del mes) + 15% ocupación + 10% km útiles.
+                                La gasolina se prorratea por km útiles; sin odómetro se imputa completa al servicio.
+                            </p>
+                        </div>
+                    )}
+                </section>
+            );
+        }
+
+        /* ============================================================================
            11. CONTROL ESTADÍSTICO DE OPERACIONES (SPC LIGERO)
            ============================================================================ */
         function SpcPanel({ spc, outliers, onPickDay }) {
@@ -1938,7 +2380,8 @@
         const SWIPE_MAX = 104;        // tope del arrastre, con resistencia más allá del umbral
 
         const DayCard = memo(forwardRef(function DayCard(
-            { day, costs, isToday, ucl, lcl, avgGasPerKm, spcSamples, onField, onAutoGoal, onRestDay }, ref) {
+            { day, costs, isToday, ucl, lcl, avgGasPerKm, spcSamples, irdScore, irdPartial, isStar,
+              onField, onAutoGoal, onRestDay }, ref) {
 
             const { cash } = useCash();
             const [open, setOpen] = useState(false);
@@ -1952,6 +2395,7 @@
             const wasComplete = useRef(false);
 
             const c = useMemo(() => computeDay(day, costs), [day, costs]);
+            const ops = useMemo(() => OperationalAnalytics.calcDailyMetrics(day), [day]);
             const equilibrium = useBreakEven(c.earned, c.breakEven);
 
             /* Destello cuando la jornada cruza el 100% de la meta */
@@ -1987,7 +2431,8 @@
                 && avgGasPerKm > 0 && c.gasPerKm > avgGasPerKm * 1.25;
 
             const extrasCount = [c.tolls, c.wash, c.misc].filter(v => v > 0).length;
-            const detailBadge = (c.hours > 0 ? 1 : 0) + (c.km > 0 ? 1 : 0) + extrasCount;
+            const opsCount = OPS_FIELDS.filter(f => hasValue(day[f])).length;
+            const detailBadge = (c.hours > 0 ? 1 : 0) + (c.km > 0 ? 1 : 0) + extrasCount + opsCount;
 
             const set = useCallback((field) => (value) => onField(day.id, field, value), [day.id, onField]);
 
@@ -2092,6 +2537,9 @@
                                         <span className="bg-sky-500/15 text-sky-300 border border-sky-500/40 text-[9px] font-extrabold uppercase tracking-[0.14em] px-1.5 py-0.5 rounded">
                                             Hoy
                                         </span>
+                                    )}
+                                    {irdScore !== null && irdScore !== undefined && (
+                                        <IrdBadge score={irdScore} partial={irdPartial} star={isStar} />
                                     )}
                                     {isHigh && <StatPill value="▲ Pico" tone="emerald" />}
                                     {isLow && <StatPill value="▼ Bajo" tone="rose" />}
@@ -2221,6 +2669,8 @@
                                                 value={day.misc} onChange={set('misc')} />
                                 </div>
 
+                                <OpsBlock day={day} ops={ops} set={set} />
+
                                 {/* Arqueo de tesorería: cómo se liquidó el ingreso del turno */}
                                 <div className="grid grid-cols-2 gap-2">
                                     <MoneyField id={`cash-${day.id}`} label="Efectivo cobrado" tone="earned" compact
@@ -2287,6 +2737,80 @@
                 </div>
             );
         }));
+
+        /* Badge del Índice de Rendimiento Diario */
+        const irdTone = (score) => (score >= 80 ? 'emerald' : score >= 60 ? 'sky' : score >= 40 ? 'amber' : 'rose');
+        const IRD_TONES = {
+            emerald: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/40',
+            sky: 'bg-sky-500/10 text-sky-300 border-sky-500/40',
+            amber: 'bg-amber-500/10 text-amber-300 border-amber-500/40',
+            rose: 'bg-rose-500/10 text-rose-300 border-rose-500/40'
+        };
+        const IrdBadge = ({ score, partial, star }) => (
+            <span title={partial
+                      ? 'Índice de Rendimiento Diario parcial: faltan datos del tablero DiDi; se reponderó con lo capturado'
+                      : 'Índice de Rendimiento Diario (40% $/km · 35% $/hr · 15% ocupación · 10% km útiles)'}
+                  className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-bold num ${IRD_TONES[irdTone(score)]}`}>
+                {star && <span aria-label="Día estrella">★</span>}
+                Score: {score}/100{partial ? '*' : ''}
+            </span>
+        );
+
+        /* Captura del tablero DiDi + odómetro y sus métricas derivadas */
+        const OpsBlock = ({ day, ops, set }) => {
+            const { cash } = useCash();
+            const pct = (v) => (v === null ? '—' : pctText(v * 100, 0));
+            const warnings = [];
+            if (ops.odometerError) warnings.push('El km final debe ser mayor que el inicial.');
+            if (ops.kmOverflow) warnings.push(`DiDi reporta más km (${money(ops.kmDidi, 1)}) que el rodado total (${money(ops.kmTotal, 1)}): los km útiles se acotan a 100%.`);
+            if (ops.timeOverflow) warnings.push('El tiempo activo supera al conectado: la ocupación se acota a 100%.');
+            return (
+                <div className="rounded-lg border border-sky-900/50 bg-sky-950/10 p-2 space-y-2">
+                    <p className="text-[9px] uppercase tracking-[0.14em] font-bold text-sky-300">Tablero DiDi y odómetro</p>
+                    <div className="grid grid-cols-3 gap-2">
+                        <MoneyField id={`kmStart-${day.id}`} label="Km inicio" tone="unit" prefix="" compact
+                                    value={day.kmStart} onChange={set('kmStart')} />
+                        <MoneyField id={`kmEnd-${day.id}`} label="Km fin" tone="unit" prefix="" compact
+                                    value={day.kmEnd} onChange={set('kmEnd')} />
+                        <MoneyField id={`kmDidi-${day.id}`} label="Km DiDi" tone="unit" prefix="km" compact
+                                    value={day.kmDidi} onChange={set('kmDidi')} />
+                        <MoneyField id={`timeOnline-${day.id}`} label="Conectado" tone="unit" prefix="" compact
+                                    sanitize={sanitizeDuration} inputMode="text" placeholder="HH:MM"
+                                    value={day.timeOnline} onChange={set('timeOnline')} />
+                        <MoneyField id={`timeActive-${day.id}`} label="Activo" tone="unit" prefix="" compact
+                                    sanitize={sanitizeDuration} inputMode="text" placeholder="HH:MM"
+                                    value={day.timeActive} onChange={set('timeActive')} />
+                        <MoneyField id={`trips-${day.id}`} label="Viajes" tone="unit" prefix="#" compact
+                                    sanitize={sanitizeInt} inputMode="numeric"
+                                    value={day.trips} onChange={set('trips')} />
+                    </div>
+                    <p className="text-[9px] text-slate-500 num">
+                        Rodado {ops.kmTotal !== null ? `${money(ops.kmTotal, 1)} km${ops.kmSource === 'manual' ? ' (campo Kilómetros)' : ''}` : '—'}
+                        {' · '}Conectado {durationText(ops.online)}{ops.onlineFromHours ? ' (de horas al volante)' : ''}
+                        {ops.active !== null ? ` · Activo ${durationText(ops.active)}` : ''}
+                    </p>
+                    {warnings.map(w => <p key={w} className="text-[9px] text-amber-300">{w}</p>)}
+                    <div className="grid grid-cols-2 gap-1.5">
+                        <DerivedStat label="Ocupación del turno" value={pct(ops.etaT)}
+                                     hint={ops.etaT !== null ? `Tiempo muerto ${durationText(Math.max(ops.online - ops.active, 0))}` : 'Captura conectado y activo'}
+                                     tone={ops.etaT !== null && ops.etaT < 0.5 ? 'warn' : 'default'} />
+                        <DerivedStat label="Km útiles" value={pct(ops.etaKm)}
+                                     hint={ops.deadKm !== null ? `${money(ops.deadKm, 1)} km fantasma` : 'Captura odómetro y km DiDi'}
+                                     tone={ops.etaKm !== null && ops.etaKm < 0.6 ? 'warn' : 'default'} />
+                        <DerivedStat label="Gasolina DiDi" value={cash(ops.gasDidi)}
+                                     hint={ops.gasProrated ? `Uso personal ${cash(ops.gasPersonal)}` : 'Sin prorrateo: 100% al servicio'} />
+                        <DerivedStat label="Margen neto" value={cash(ops.margin)}
+                                     hint="Ingreso − gasolina DiDi" tone={ops.margin < 0 ? 'warn' : 'default'} />
+                        <DerivedStat label="$ por km neto" value={ops.rKm !== null ? `${cash(ops.rKm)}/km` : '—'}
+                                     hint="MN / km DiDi" />
+                        <DerivedStat label="$ por hora neto" value={ops.rHr !== null ? `${cash(ops.rHr)}/h` : '—'}
+                                     hint="MN / horas conectado" />
+                        <DerivedStat label="Ticket efectivo" value={ops.epv !== null ? cash(ops.epv) : '—'}
+                                     hint={ops.tripsPerHour !== null ? `${money(ops.tripsPerHour, 1)} viajes/h` : 'Captura los viajes'} />
+                    </div>
+                </div>
+            );
+        };
 
         const DerivedStat = ({ label, value, hint, tone = 'default' }) => (
             <div className={`rounded-lg border px-2 py-1.5 ${
@@ -4613,6 +5137,8 @@
             const basis = meta.accountingBasis === 'accrual' ? 'accrual' : 'cash';
             const metrics = useFinancialTelemetry(list, costs, elapsedDays, basis);
             const deferredList = useDeferredValue(list);
+            /* Analítica operativa: IRD por jornada y agregados semanales/mensuales */
+            const opsAnalytics = useMemo(() => OperationalAnalytics.calcMonth(list), [list]);
             const deferredMetrics = useFinancialTelemetry(deferredList, costs, elapsedDays, basis);
             const prediction = usePredictiveModels(deferredList, deferredMetrics, costs, elapsedDays,
                                                    mountedTabs.inteligencia);
@@ -4967,7 +5493,11 @@
             const exportCsv = useCallback(() => {
                 const header = ['ID', 'Fecha', 'Dia', 'Meta', 'Depositado', 'Gasolina', 'Casetas', 'Lavado',
                                 'Varios', 'Gasto Total', 'Ganancia Bolsillo', 'Cumplimiento %', 'Retencion Gas %',
-                                'Retorno Efectivo %', 'Horas', 'Km', '$/hr Bolsillo'];
+                                'Retorno Efectivo %', 'Horas', 'Km', '$/hr Bolsillo',
+                                'Km Inicio', 'Km Fin', 'Km DiDi', 'Conectado min', 'Activo min', 'Viajes',
+                                'Eta Km %', 'Eta Tiempo %', 'Gasolina DiDi', 'Margen Neto', '$/km Neto',
+                                '$/hr Neto', 'Ticket EPV', 'IRD'];
+                const opt = (v, d = 2) => (v === null || v === undefined ? '' : v.toFixed(d));
                 const escape = (cell) => {
                     const text = String(cell);
                     return /[",;\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
@@ -4981,7 +5511,19 @@
                         c.cashOut.toFixed(2), c.pocket.toFixed(2), c.percentage.toFixed(1),
                         c.fuelRetention.toFixed(1), c.returnRate.toFixed(1),
                         c.hours ? c.hours.toFixed(2) : '', c.km ? c.km.toFixed(2) : '',
-                        c.pocketPerHour !== null ? c.pocketPerHour.toFixed(2) : ''
+                        c.pocketPerHour !== null ? c.pocketPerHour.toFixed(2) : '',
+                        ...(() => {
+                            const o = opsAnalytics.daily[i];
+                            const r = opsAnalytics.ird[i];
+                            return [
+                                day.kmStart || '', day.kmEnd || '', day.kmDidi || '',
+                                opt(parseDuration(day.timeOnline), 0), opt(o.active, 0), day.trips || '',
+                                opt(o.etaKm !== null ? o.etaKm * 100 : null, 1),
+                                opt(o.etaT !== null ? o.etaT * 100 : null, 1),
+                                o.worked ? o.gasDidi.toFixed(2) : '', o.worked ? o.margin.toFixed(2) : '',
+                                opt(o.rKm), opt(o.rHr), opt(o.epv), r ? r.score : ''
+                            ];
+                        })()
                     ].map(escape).join(',');
                 });
                 const totals = [
@@ -4992,14 +5534,21 @@
                     metrics.goalProgress.toFixed(1), metrics.fuelRetention.toFixed(1),
                     metrics.returnRate.toFixed(1),
                     metrics.totalHours.toFixed(2), metrics.totalKm.toFixed(2),
-                    metrics.pocketPerHour !== null ? metrics.pocketPerHour.toFixed(2) : ''
+                    metrics.pocketPerHour !== null ? metrics.pocketPerHour.toFixed(2) : '',
+                    '', '', '', '', '', opsAnalytics.aggregates.month.trips || '',
+                    opt(opsAnalytics.aggregates.month.etaKm !== null ? opsAnalytics.aggregates.month.etaKm * 100 : null, 1),
+                    opt(opsAnalytics.aggregates.month.etaT !== null ? opsAnalytics.aggregates.month.etaT * 100 : null, 1),
+                    '', opsAnalytics.aggregates.month.margin.toFixed(2),
+                    opt(opsAnalytics.aggregates.month.rKm), opt(opsAnalytics.aggregates.month.rHr),
+                    opt(opsAnalytics.aggregates.month.epv),
+                    opsAnalytics.aggregates.month.ird !== null ? opsAnalytics.aggregates.month.ird.toFixed(0) : ''
                 ].map(escape).join(',');
 
                 const csv = '﻿' + [header.join(','), ...rows, totals].join('\r\n');
                 const ok = downloadBlob(csv, `didi-reporte-${monthId(year, monthIndex)}.csv`, 'text/csv;charset=utf-8;');
                 notify(ok ? 'Reporte CSV descargado' : 'No se pudo generar la descarga', ok ? 'ok' : 'warn');
                 setToolsOpen(false);
-            }, [list, metrics, year, monthIndex, downloadBlob, notify]);
+            }, [list, metrics, opsAnalytics, year, monthIndex, downloadBlob, notify]);
 
             const copySummary = useCallback(() => {
                 const lines = [
@@ -5257,12 +5806,17 @@
                                          lcl={deferredMetrics.spc.lcl}
                                          spcSamples={deferredMetrics.spc.n}
                                          avgGasPerKm={deferredMetrics.avgGasPerKm}
+                                         irdScore={opsAnalytics.irdById[day.id] ? opsAnalytics.irdById[day.id].score : null}
+                                         irdPartial={opsAnalytics.irdById[day.id] ? opsAnalytics.irdById[day.id].partial : false}
+                                         isStar={opsAnalytics.aggregates.star !== null && opsAnalytics.aggregates.star.id === day.id}
                                          onField={handleField}
                                          onAutoGoal={handleAutoGoal}
                                          onRestDay={handleRestDay}
                                          ref={(node) => { dayRefs.current[day.id] = node; }} />
                             ))}
                         </section>
+
+                        <OperationalIntelPanel aggregates={opsAnalytics.aggregates} onPickDay={focusDay} />
 
                         <p className="text-center text-[10px] text-slate-600 pt-2 num">
                             {monthLabel(year, monthIndex)} · guardado en didi_data_{year}_{String(monthIndex + 1).padStart(2, '0')}
