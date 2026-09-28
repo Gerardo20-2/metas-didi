@@ -1,0 +1,62 @@
+/* Fuente de estilos: Tailwind + estilos propios. Se compila a css/styles.css con `npm run build`.
+   Los estilos propios van fuera de @layer para que Tailwind nunca los purgue, y antes de
+   las utilidades para conservar la precedencia que tenían con el CDN. */
+@tailwind base;
+@tailwind components;
+
+html, body { background-color: #020617; height: 100%; }
+body {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior-y: none;
+}
+.num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+input[type="text"] { -webkit-appearance: none; appearance: none; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 9999px; }
+.sheet-in { animation: sheetIn .22s cubic-bezier(.2,.8,.3,1); }
+@keyframes sheetIn { from { transform: translateY(14px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+.fade-in { animation: fadeIn .18s ease-out; }
+@keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+
+/* Motion: todo sobre transform/opacity para mantener el trabajo en la GPU */
+.gpu { will-change: transform; transform: translate3d(0, 0, 0); backface-visibility: hidden; }
+.swipe-layer { transition: transform .28s cubic-bezier(.22,.9,.28,1); }
+.swipe-layer.dragging { transition: none; }
+.goal-glow { animation: goalGlow 2.4s ease-in-out infinite; }
+@keyframes goalGlow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.0); }
+    50%      { box-shadow: 0 0 18px -4px rgba(16, 185, 129, 0.55); }
+}
+.goal-burst { animation: goalBurst .52s cubic-bezier(.34,1.56,.64,1); }
+@keyframes goalBurst {
+    0%   { transform: scale(1); }
+    40%  { transform: scale(1.022); }
+    100% { transform: scale(1); }
+}
+.hud-rise { animation: hudRise .26s cubic-bezier(.22,.9,.28,1); }
+@keyframes hudRise { from { transform: translate3d(0, 22px, 0); opacity: 0 } to { transform: translate3d(0,0,0); opacity: 1 } }
+.press { transition: transform .12s cubic-bezier(.22,.9,.28,1); }
+.press:active { transform: scale(.94); }
+.arc-anim { transition: stroke-dashoffset .6s cubic-bezier(.22,.9,.28,1), stroke .4s linear; }
+input[type="range"] { -webkit-appearance: none; appearance: none; background: transparent; }
+input[type="range"]::-webkit-slider-runnable-track { height: 4px; border-radius: 9999px; background: #1e293b; }
+input[type="range"]::-moz-range-track { height: 4px; border-radius: 9999px; background: #1e293b; }
+input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; margin-top: -7px;
+    width: 18px; height: 18px; border-radius: 9999px; background: #0ea5e9;
+    border: 2px solid #0f172a; box-shadow: 0 0 0 1px #0ea5e9;
+}
+input[type="range"]::-moz-range-thumb {
+    width: 18px; height: 18px; border: 2px solid #0f172a; border-radius: 9999px;
+    background: #0ea5e9; box-shadow: 0 0 0 1px #0ea5e9;
+}
+.focus-ring:focus-visible { outline: 2px solid #0ea5e9; outline-offset: 2px; }
+.stealth-blur { filter: blur(6px); transition: filter .15s ease; user-select: none; }
+.scrub { touch-action: pan-y; -webkit-tap-highlight-color: transparent; }
+@media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}
+
+@tailwind utilities;
