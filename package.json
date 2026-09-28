@@ -1,0 +1,24 @@
+{
+  "name": "didi-analytics-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DiDi Analytics & Tracker: PWA de telemetría financiera y operativa para conductor de plataforma.",
+  "scripts": {
+    "build": "npm run build:vendor && npm run build:js && npm run build:css",
+    "build:vendor": "node scripts/copy-vendor.mjs",
+    "build:js": "babel src/app.jsx --no-babelrc --presets=@babel/preset-react -o js/app.js && terser js/app.js --compress --mangle --comments false -o js/app.js",
+    "build:css": "tailwindcss -c tailwind.config.js -i src/styles.css -o css/styles.css --minify",
+    "icons": "node scripts/generate-icons.mjs",
+    "serve": "node scripts/serve.mjs"
+  },
+  "devDependencies": {
+    "@babel/cli": "7.26.4",
+    "@babel/core": "7.29.7",
+    "@babel/preset-react": "7.26.3",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "sharp": "0.35.5",
+    "tailwindcss": "3.4.17",
+    "terser": "5.37.0"
+  }
+}

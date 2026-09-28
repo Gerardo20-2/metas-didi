@@ -1,8 +1,80 @@
-# Telemetría DiDi Pro
+# DiDi Analytics & Tracker
 
 Sistema de contabilidad analítica y contraloría de caja para conductor de plataforma.
-Un único archivo autónomo (`index.html`) que corre en cualquier navegador móvil, sin build ni servidor,
-e instalable como app gracias a un manifest PWA embebido.
+Progressive Web App instalable en el celular, que abre al instante y funciona sin conexión.
+Se despliega automáticamente en GitHub Pages con cada push a `main`.
+
+## Estructura del repositorio
+
+```
+├── index.html                  Shell HTML: manifest, iconos, scripts y registro del Service Worker
+├── manifest.json               Manifest PWA (standalone, #0f172a)
+├── sw.js                       Service Worker: precarga del app shell + stale-while-revalidate
+├── css/styles.css              Tailwind compilado + estilos propios   (generado)
+├── js/app.js                   App React compilada y minificada        (generado)
+├── js/vendor/                  React 18.3.1 y ReactDOM 18.3.1 UMD      (generado)
+├── icons/                      icon.svg, icon-maskable.svg y sus PNG (192, 512, maskable, apple 180, favicon 32)
+├── src/app.jsx                 Código fuente de la app (JSX)
+├── src/styles.css              Fuente de estilos
+├── scripts/                    copy-vendor, generate-icons y serve (servidor local)
+├── tailwind.config.js
+├── package.json
+└── .github/workflows/deploy.yml
+```
+
+Los archivos marcados como *generados* se versionan para que el repositorio funcione tal cual, pero
+el despliegue los reconstruye siempre desde `src/`. **Edita `src/app.jsx` y `src/styles.css`, nunca
+`js/app.js` ni `css/styles.css`.**
+
+## Desarrollo local
+
+Requiere Node 20 o superior.
+
+```bash
+npm ci              # instala dependencias de build
+npm run build       # src/app.jsx → js/app.js · src/styles.css → css/styles.css · React → js/vendor
+npm run serve       # http://localhost:8080  (el Service Worker requiere http, no file://)
+npm run icons       # solo si cambias icons/icon.svg o icons/icon-maskable.svg
+```
+
+`index.html` también abre directo con doble clic (`file://`), pero sin caché offline.
+
+## Despliegue en GitHub Pages
+
+El flujo `.github/workflows/deploy.yml` corre en cada push a `main` (y a mano desde la pestaña
+Actions con *Run workflow*): instala dependencias, compila, sella `sw.js` con el SHA del commit para
+invalidar la caché anterior y publica en Pages.
+
+### Activar GitHub Pages (una sola vez)
+
+1. En GitHub abre el repositorio → **Settings** → **Pages** (menú lateral, sección *Code and automation*).
+2. En **Build and deployment → Source** elige **GitHub Actions** (no *Deploy from a branch*).
+3. Asegúrate de que exista la rama `main` con este código (ver abajo) y haz push, o ve a
+   **Actions → Deploy PWA to GitHub Pages → Run workflow**.
+4. Cuando el job `deploy` termine en verde, la URL aparece en **Settings → Pages** y en el resumen
+   del workflow: `https://<tu-usuario>.github.io/<nombre-del-repo>/`.
+5. Si el repositorio es privado, GitHub Pages requiere un plan de pago (Pro, Team o Enterprise);
+   en cuentas gratuitas el repositorio debe ser público.
+
+Si el job `deploy` falla con *"Branch main is not allowed to deploy to github-pages"*, entra a
+**Settings → Environments → github-pages → Deployment branches** y agrega `main`.
+
+### Instalar en el celular
+
+- **Android (Chrome):** abre la URL → menú ⋮ → **Instalar app**.
+- **iPhone (Safari):** abre la URL → botón Compartir → **Agregar a pantalla de inicio**.
+
+### Tus datos al cambiar de URL
+
+Los registros viven en el `localStorage` del navegador y están ligados al dominio. Si antes usabas
+el archivo local, en la URL nueva la app arrancará vacía: en la versión anterior abre el menú de
+herramientas (icono de controles, arriba a la derecha) → **Exportar base histórica**, y en la app
+publicada usa **Importar respaldo** con ese archivo.
+
+### Actualizaciones
+
+Tras cada despliegue, la app sigue abriendo al instante con la versión en caché y descarga la nueva
+en segundo plano; la verás al volver a abrirla.
 
 ## Navegación: tres pestañas
 
@@ -26,12 +98,6 @@ posterior es instantáneo y la simulación Monte Carlo no se ejecuta hasta abrir
 El análisis por jornada (ritmo del turno, margen de seguridad y punto de equilibrio) vive dentro
 del detalle plegable de cada tarjeta, para que la cara visible tenga solo meta, depositado y gasolina.
 
-## Uso
-
-Abre `index.html` en el navegador del teléfono y usa "Añadir a pantalla de inicio".
-El manifest (`display: standalone`, fondo `#020617`) y el icono de tacómetro van embebidos como Data URI,
-así que funciona igual servido por `file://` o por un servidor local.
-
 ## Arquitectura de datos
 
 | Clave | Contenido |
@@ -44,7 +110,8 @@ así que funciona igual servido por `file://` o por un servidor local.
   Septiembre 2026, se copia sin alterar un solo peso. La clave original nunca se borra y sigue
   recibiendo los cambios de ese mes, así que la versión anterior del archivo la sigue abriendo.
 - **Campos por día:** `id`, `dateString`, `dayName`, `goal`, `earned`, `gas` (esquema original, intacto)
-  más los opcionales `hours`, `km`, `tolls`, `wash`, `misc`, `cashCollected` y `appDeposit`.
+  más los opcionales `hours`, `km`, `tolls`, `wash`, `misc`, `cashCollected`, `appDeposit`
+  y los del tablero DiDi `kmStart`, `kmEnd`, `kmDidi`, `timeOnline`, `timeActive`, `trips`.
 - **Calendario real:** los días de cada mes y su día de la semana se calculan con `new Date`,
   incluyendo años bisiestos (Febrero 2028 rinde 29 tarjetas).
 
@@ -123,6 +190,46 @@ Un inspector recorre el mes y levanta banderas navegables — al tocarlas, la ap
 - **Costo huérfano:** gasolina o peajes sin actividad operativa.
 - **Margen negativo:** los costos directos superaron lo depositado.
 - **Margen inverosímil:** más de 95% de margen con kilometraje alto (falta registrar combustible).
+
+## Analítica operativa: tablero DiDi + odómetro
+
+Dentro de **Detalle operativo**, cada jornada admite los datos del tablero de DiDi y del odómetro
+(campos opcionales `kmStart`, `kmEnd`, `kmDidi`, `timeOnline`, `timeActive`, `trips`).
+Los tiempos aceptan minutos (`450`) o formato reloj (`7:30`, también `7h30`).
+
+| Métrica | Cálculo |
+| --- | --- |
+| Rodado total | `km_fin − km_inicio` (si no hay odómetro, se usa el campo Kilómetros) |
+| Km útiles η_km | `km_didi / km_total`, acotado a 100% |
+| Ocupación η_t | `t_activo / t_conectado` (si no hay tiempo conectado, se usan las horas al volante) |
+| Gasolina DiDi | `gasolina × η_km`; el resto se reporta como uso personal. Sin η_km se imputa completa |
+| Margen neto MN | `ingreso − gasolina DiDi` |
+| R_km / R_hr | `MN / km_didi` y `MN / (t_conectado / 60)` |
+| Ticket EPV | `ingreso / viajes` |
+
+### Índice de Rendimiento Diario (IRD, 0–100)
+
+```
+IRD = 100 × (0.40·x_km + 0.35·x_hr + 0.15·η_t + 0.10·η_km) / Σ pesos disponibles
+x_km = R_km / máx(R_km del mes)      x_hr = R_hr / máx(R_hr del mes)     (acotados a [0, 1])
+```
+
+La normalización contra el mejor día del mes hace que un día con el 90% del mejor $/km reciba 0.9
+(en min-max recibiría una fracción arbitraria y el peor día siempre 0). Si faltan indicadores,
+el puntaje se repondera con los disponibles y el badge se marca con `*`; sin $/km ni $/hr no hay puntaje.
+Cada tarjeta muestra el badge `Score: NN/100` y el día estrella (`argmax IRD`) lleva ★.
+
+### Tablero de Inteligencia Operativa
+
+Sección colapsable al final de **Registro** (motor `OperationalAnalytics`):
+
+- **Día de mayor rentabilidad:** fecha, IRD, $/km neto, $/hr neto y horas conectado; al tocarlo enfoca la tarjeta.
+- **Eficiencia de flota:** % de km útiles y % de tiempo activo del mes (ponderados: Σ útil / Σ total).
+- **Perfil por día de la semana:** $/km, $/hr, % de km muertos e IRD promedio de lunes a domingo;
+  resalta el día con mayor $/hr neto y el de más km fantasma.
+- **Semana contra semana:** margen neto y $/km por semana calendario con `WoW% = (Sₜ − Sₜ₋₁) / |Sₜ₋₁| × 100`.
+
+El CSV del mes incluye las nuevas columnas (odómetro, tiempos, viajes, η, MN, R_km, R_hr, EPV e IRD).
 
 ## Cédula de liquidación y libro diario
 
@@ -251,7 +358,8 @@ cruzan el 100% reciben un destello y un glow esmeralda pulsante. Todo respeta
 
 ## Stack
 
-React 18, ReactDOM 18 y Babel Standalone desde cdnjs, más Tailwind CSS por CDN.
+React 18 y ReactDOM 18 servidos desde el mismo origen; JSX precompilado con Babel y Tailwind CSS v3
+compilado en build (sin CDN ni transpilación en el navegador).
 Cero librerías de gráficos, iconos, animación ni matemáticas: todo es SVG inline, CSS y `Math` nativo.
 La matemática vive en hooks desacoplados del render (`useFinancialTelemetry`, `useBreakEven`,
 `useAnimatedNumber`); los cálculos pesados van en `useMemo`, los handlers en `useCallback` y las
