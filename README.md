@@ -83,8 +83,25 @@ La app se organiza en una barra inferior fija de 62 px dentro de la zona del pul
 | Pestaña | Para qué sirve | Qué contiene |
 | --- | --- | --- |
 | **Registro** (por defecto) | Capturar en un alto | Banner del turno de hoy con meta, depositado, gasolina y bolsillo, acceso al HUD, filtros con contadores y la lista de jornadas |
-| **Cockpit** | Revisar el mes | Ganancia de bolsillo, cuota diaria, tacómetro de pacing, KPIs, curva acumulada, estado de resultados, variaciones, conciliación y auditoría |
-| **Inteligencia** | Analizar fuera de turno | Monte Carlo, Holt, simulador, heatmap, rentabilidad por día y control estadístico |
+| **Cockpit** | Revisar el mes | Resumen de bolsillo + grupos **Meta y ritmo** y **Contabilidad** |
+| **Inteligencia** | Analizar fuera de turno | Grupos **Pronóstico y escenarios** y **Rendimiento operativo** |
+
+### Análisis agrupados
+
+Los análisis que se complementan viven juntos en una tarjeta con pestañas internas (`Bundle`).
+Solo se dibuja la vista activa y cada grupo recuerda la última pestaña abierta en ese dispositivo.
+
+| Pestaña | Grupo | Vistas |
+| --- | --- | --- |
+| Cockpit | Resumen del mes | Bolsillo, equilibrio, gasolina/ruta/cartera, progreso de meta, efectividad y economía unitaria (bolsillo proyectado, por hora y por km) |
+| Cockpit | Meta y ritmo | **Ritmo** (tacómetro de pacing + curva de acumulación) · **Cuota** (estrategia alivio/récord, descansos y proyección por perfil) · **Variaciones** |
+| Cockpit | Contabilidad | **Resultados** (estado de resultados y ratios) · **Cortes** (conciliación semanal) · **Auditoría** |
+| Inteligencia | Pronóstico y escenarios | **Pronóstico** (Monte Carlo, Holt y modelos avanzados) · **Simulador** |
+| Inteligencia | Rendimiento operativo | **Resumen** (día estrella, eficiencia de flota, semana contra semana) · **Semana** (neto por día + $/km, $/hr, km muertos e IRD) · **Mapa** (heatmap) · **Dispersión** (control estadístico) |
+
+Se eliminaron las repeticiones: la rejilla de 9 KPIs (depositado, gasolina, ruta, meta y proyección
+ya aparecían en el resumen o en la estrategia de cuota), la tarjeta suelta de cuota diaria (ahora es
+el subtítulo de *Meta y ritmo*) y el medidor de retención de combustible (el mismo % que la ficha de gasolina).
 
 **El problema que resuelve:** antes, el primer campo de captura quedaba a **4,393 px** de scroll,
 sepultado bajo los módulos analíticos. Ahora está a **415 px** y visible sin desplazarse, con el
@@ -221,7 +238,7 @@ Cada tarjeta muestra el badge `Score: NN/100` y el día estrella (`argmax IRD`) 
 
 ### Tablero de Inteligencia Operativa
 
-Sección colapsable al final de **Registro** (motor `OperationalAnalytics`):
+Vive en **Inteligencia → Rendimiento operativo** (motor `OperationalAnalytics`):
 
 - **Día de mayor rentabilidad:** fecha, IRD, $/km neto, $/hr neto y horas conectado; al tocarlo enfoca la tarjeta.
 - **Eficiencia de flota:** % de km útiles y % de tiempo activo del mes (ponderados: Σ útil / Σ total).

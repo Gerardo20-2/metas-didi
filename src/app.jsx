@@ -1447,25 +1447,14 @@
         });
         const useCash = () => useContext(CashCtx);
 
-        const MetricTile = ({ icon, label, value, sub, tone = 'neutral', masked }) => {
-            const tones = {
-                neutral: 'text-slate-100',
-                positive: 'text-emerald-400',
-                negative: 'text-rose-400',
-                info: 'text-sky-400',
-                warning: 'text-amber-400'
-            };
-            return (
-                <div className="bg-slate-900 rounded-xl border border-slate-800 px-3 py-2.5">
-                    <div className="flex items-center gap-1.5 text-slate-300 mb-1">
-                        {icon}
-                        <span className="text-[9px] uppercase tracking-[0.12em] font-bold truncate">{label}</span>
-                    </div>
-                    <p className={`text-lg font-bold num leading-tight ${tones[tone]} ${masked ? 'stealth-blur' : ''}`}>{value}</p>
-                    {sub && <p className="text-[10px] text-slate-500 num mt-0.5 truncate">{sub}</p>}
-                </div>
-            );
-        };
+        /* Métrica compacta sin tarjeta propia, para franjas dentro de otra tarjeta */
+        const UnitStat = ({ label, value, sub, tone = 'neutral', masked }) => (
+            <div className="min-w-0">
+                <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold truncate">{label}</p>
+                <p className={`text-[15px] font-bold num leading-tight mt-0.5 ${tone === 'info' ? 'text-sky-300' : 'text-slate-100'} ${masked ? 'stealth-blur' : ''}`}>{value}</p>
+                {sub && <p className="text-[9px] text-slate-500 num truncate">{sub}</p>}
+            </div>
+        );
 
         /* Contador fluido aislado: solo este nodo se repinta durante la animación */
         const AnimatedCash = memo(function AnimatedCash({ value, decimals = 2, className = '' }) {
@@ -1487,8 +1476,13 @@
             </div>
         );
 
-        const SectionCard = ({ title, subtitle, action, children, className = '' }) => (
-            <section className={`bg-slate-900 rounded-2xl border border-slate-800 p-4 ${className}`}>
+        /* true cuando el panel se muestra dentro de un Bundle: sin marco propio */
+        const EmbedCtx = createContext(false);
+
+        const SectionCard = ({ title, subtitle, action, children, className = '' }) => {
+            const embedded = useContext(EmbedCtx);
+            return (
+            <section className={embedded ? `p-4 pt-3 ${className}` : `bg-slate-900 rounded-2xl border border-slate-800 p-4 ${className}`}>
                 {(title || action) && (
                     <div className="flex items-start justify-between gap-3 mb-3">
                         <div className="min-w-0">
@@ -1500,7 +1494,62 @@
                 )}
                 {children}
             </section>
-        );
+            );
+        };
+
+        /* ----------------------------------------------------------------------------
+           Bundle: agrupa análisis complementarios en una sola tarjeta con pestañas
+           internas. Solo se monta la vista activa y la elección se recuerda por grupo.
+           ---------------------------------------------------------------------------- */
+        const BUNDLE_KEY = 'didi_ui_bundle_';
+        function Bundle({ id, title, subtitle, icon, action, tabs }) {
+            const visible = tabs.filter(Boolean);
+            const [active, setActive] = useState(() => {
+                const stored = safeGet(BUNDLE_KEY + id);
+                return visible.some(t => t.id === stored) ? stored : visible[0].id;
+            });
+            const current = visible.find(t => t.id === active) || visible[0];
+            const pick = (tabId) => {
+                setActive(tabId);
+                safeSet(BUNDLE_KEY + id, tabId);
+                haptic(10);
+            };
+            return (
+                <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
+                    <div className="flex items-start justify-between gap-3 px-4 pt-4">
+                        <div className="min-w-0 flex items-start gap-2">
+                            {icon && <span className="text-slate-400 mt-0.5 shrink-0">{icon}</span>}
+                            <div className="min-w-0">
+                                <h2 className="text-slate-100 text-sm font-semibold tracking-tight">{title}</h2>
+                                {subtitle && <p className="text-slate-500 text-[11px] mt-0.5 num">{subtitle}</p>}
+                            </div>
+                        </div>
+                        {action}
+                    </div>
+                    <div role="tablist" aria-label={title}
+                         className="flex gap-1 mx-4 mt-3 p-1 rounded-xl bg-slate-950/60 border border-slate-800 overflow-x-auto">
+                        {visible.map(t => {
+                            const on = t.id === current.id;
+                            return (
+                                <button key={t.id} role="tab" aria-selected={on} onClick={() => pick(t.id)}
+                                        className={`focus-ring flex-1 min-w-max flex items-center justify-center gap-1 rounded-lg px-2 py-1.5 text-[11px] font-bold transition-colors ${
+                                            on ? 'bg-slate-800 text-slate-100 shadow' : 'text-slate-400 hover:text-slate-200'}`}>
+                                    {t.label}
+                                    {t.count > 0 && (
+                                        <span className={`num text-[9px] rounded px-1 border ${
+                                            t.countTone === 'warn' ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                                            : 'bg-sky-500/15 text-sky-300 border-sky-500/30'}`}>{t.count}</span>
+                                    )}
+                                </button>
+                            );
+                        })}
+                    </div>
+                    <EmbedCtx.Provider value={true}>
+                        <div key={current.id} role="tabpanel" className="fade-in">{current.render()}</div>
+                    </EmbedCtx.Provider>
+                </section>
+            );
+        }
 
         const MoneyField = ({ id, label, value, onChange, tone, prefix = '$', compact,
                               sanitize = sanitizeMoney, inputMode = 'decimal', placeholder = '0' }) => {
@@ -1985,9 +2034,9 @@
         /* ============================================================================
            10b. TABLERO DE INTELIGENCIA OPERATIVA (IRD, eficiencia y perfil semanal)
            ============================================================================ */
-        function OperationalIntelPanel({ aggregates, onPickDay }) {
+        /* view: 'summary' (día estrella, eficiencia de flota y WoW) o 'weekday' (tabla lunes-domingo) */
+        function OperationalIntelPanel({ aggregates, onPickDay, view = 'summary' }) {
             const { cash } = useCash();
-            const [open, setOpen] = useState(false);
             const { star, month, weekdays, weekly, bestHourlyWeekday, worstDeadWeekday } = aggregates;
             const pct = (v) => (v === null ? '—' : pctText(v * 100, 0));
             const perUnit = (v, unit) => (v === null ? '—' : `${cash(v, 1)}${unit}`);
@@ -1995,22 +2044,9 @@
             const deltaTone = (v) => (v === null ? 'text-slate-500' : v >= 0 ? 'text-emerald-400' : 'text-rose-400');
 
             return (
-                <section className="bg-slate-900 rounded-2xl border border-slate-800">
-                    <button onClick={() => { setOpen(o => !o); haptic(10); }} aria-expanded={open}
-                            className="focus-ring press w-full flex items-center justify-between gap-3 p-4 text-left">
-                        <span className="min-w-0">
-                            <span className="block text-slate-100 text-sm font-semibold tracking-tight">Tablero de Inteligencia Operativa</span>
-                            <span className="block text-slate-500 text-[11px] mt-0.5">
-                                {star ? `Día estrella: ${star.label} · Score ${star.ird.score}/100` : 'Captura el tablero DiDi en tus jornadas'}
-                            </span>
-                        </span>
-                        <span className={`text-slate-400 transition-transform ${open ? 'rotate-180' : ''}`}><IconChevronD size={18} /></span>
-                    </button>
-
-                    {open && (
-                        <div className="px-4 pb-4 space-y-3 fade-in">
+                <div className="p-4 pt-3 space-y-3">
                             {/* Card 1: Día de mayor rentabilidad */}
-                            <div className="rounded-xl border border-emerald-900/50 bg-emerald-950/15 p-3">
+                            {view === 'summary' && <div className="rounded-xl border border-emerald-900/50 bg-emerald-950/15 p-3">
                                 <p className="text-[9px] uppercase tracking-[0.14em] font-bold text-emerald-300 mb-1.5">Día de mayor rentabilidad</p>
                                 {star ? (
                                     <button onClick={() => onPickDay(star.id)} className="focus-ring w-full text-left">
@@ -2039,10 +2075,10 @@
                                 ) : (
                                     <p className="text-[11px] text-slate-500">Aún no hay jornadas con ingreso y km DiDi u horas conectado.</p>
                                 )}
-                            </div>
+                            </div>}
 
                             {/* Card 2: Eficiencia de flota */}
-                            <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                            {view === 'summary' && <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
                                 <p className="text-[9px] uppercase tracking-[0.14em] font-bold text-sky-300 mb-2">Eficiencia de flota · promedio mensual</p>
                                 <div className="grid grid-cols-2 gap-2">
                                     <div>
@@ -2080,10 +2116,10 @@
                                         <p className="text-[12px] font-bold num text-slate-100">{month.epv !== null ? cash(month.epv) : '—'}</p>
                                     </div>
                                 </div>
-                            </div>
+                            </div>}
 
                             {/* Card 3: Perfil por día de la semana */}
-                            <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                            {view === 'weekday' && <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
                                 <p className="text-[9px] uppercase tracking-[0.14em] font-bold text-amber-300 mb-2">Perfil por día de la semana</p>
                                 <table className="w-full text-[11px] num">
                                     <thead>
@@ -2117,10 +2153,10 @@
                                         {worstDeadWeekday && <>Más km fantasma: <span className="text-rose-400 font-semibold">{worstDeadWeekday.name}</span> ({pct(worstDeadWeekday.deadRatio)}).</>}
                                     </p>
                                 )}
-                            </div>
+                            </div>}
 
                             {/* Comparativo semana contra semana */}
-                            {weekly.length > 0 && (
+                            {view === 'summary' && weekly.length > 0 && (
                                 <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
                                     <p className="text-[9px] uppercase tracking-[0.14em] font-bold text-slate-300 mb-2">Semana contra semana (WoW)</p>
                                     <table className="w-full text-[11px] num">
@@ -2148,13 +2184,13 @@
                                 </div>
                             )}
 
-                            <p className="text-[9px] text-slate-500 leading-relaxed">
-                                IRD = 40% $/km neto + 35% $/hr neto (ambos contra el mejor día del mes) + 15% ocupación + 10% km útiles.
-                                La gasolina se prorratea por km útiles; sin odómetro se imputa completa al servicio.
-                            </p>
-                        </div>
-                    )}
-                </section>
+                            {view === 'summary' && (
+                                <p className="text-[9px] text-slate-500 leading-relaxed">
+                                    IRD = 40% $/km neto + 35% $/hr neto (ambos contra el mejor día del mes) + 15% ocupación + 10% km útiles.
+                                    La gasolina se prorratea por km útiles; sin odómetro se imputa completa al servicio.
+                                </p>
+                            )}
+                </div>
             );
         }
 
@@ -2163,7 +2199,10 @@
            ============================================================================ */
         function SpcPanel({ spc, outliers, onPickDay }) {
             const { cash } = useCash();
-            const [open, setOpen] = useState(false);
+            const [openState, setOpen] = useState(false);
+            /* Dentro de un grupo el panel va siempre abierto y sin su propio encabezado */
+            const embedded = useContext(EmbedCtx);
+            const open = openState || embedded;
             const verdictTone = {
                 positive: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30',
                 warning: 'bg-amber-500/10 text-amber-300 border-amber-500/30',
@@ -2173,7 +2212,8 @@
             const tone = spc.verdict ? verdictTone[spc.verdict.tone] : verdictTone.neutral;
 
             return (
-                <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
+                <section className={embedded ? 'pt-3' : 'bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden'}>
+                    {!embedded && (
                     <button onClick={() => { setOpen(o => !o); haptic(10); }}
                             aria-expanded={open}
                             className="focus-ring w-full flex items-center justify-between gap-3 p-4 text-left">
@@ -2190,6 +2230,7 @@
                             <IconChevronD size={18} />
                         </span>
                     </button>
+                    )}
 
                     {open && (
                         <div className="px-4 pb-4 fade-in">
@@ -3230,6 +3271,7 @@
            15b-3. PANEL PREDICTIVO: MONTE CARLO, HOLT, OEE Y ELASTICIDAD
            ============================================================================ */
         function PredictivePanel({ prediction, metrics, samples, targetDaily }) {
+            const embedded = useContext(EmbedCtx);
             const { cash } = useCash();
             const [open, setOpen] = useState(false);
             const mc = prediction.monteCarlo;
@@ -3239,7 +3281,7 @@
                 : probability >= 40 ? 'text-amber-400' : 'text-rose-400';
 
             return (
-                <section className="bg-slate-900 rounded-2xl border border-slate-800 p-4">
+                <section className={embedded ? 'p-4 pt-3' : 'bg-slate-900 rounded-2xl border border-slate-800 p-4'}>
                     <div className="flex items-start justify-between gap-3 mb-3">
                         <div className="min-w-0">
                             <h2 className="text-slate-100 text-sm font-semibold tracking-tight">Pronóstico estocástico</h2>
@@ -3423,11 +3465,15 @@
 
         function IncomeStatementPanel({ metrics, basis, onBasis }) {
             const { cash } = useCash();
-            const [open, setOpen] = useState(false);
+            const [openState, setOpen] = useState(false);
+            /* Dentro de un grupo el panel va siempre abierto y sin su propio encabezado */
+            const embedded = useContext(EmbedCtx);
+            const open = openState || embedded;
             const accrual = basis === 'accrual';
 
             return (
-                <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
+                <section className={embedded ? 'pt-3' : 'bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden'}>
+                    {!embedded && (
                     <button onClick={() => { setOpen(o => !o); feedback.tap(); }} aria-expanded={open}
                             className="focus-ring w-full flex items-center justify-between gap-3 p-4 text-left">
                         <span className="flex items-center gap-2 min-w-0">
@@ -3444,6 +3490,7 @@
                             <IconChevronD size={18} />
                         </span>
                     </button>
+                    )}
 
                     {open && (
                         <div className="px-4 pb-4 fade-in">
@@ -3539,11 +3586,15 @@
            ============================================================================ */
         function SettlementPanel({ metrics, settlements, onSettlement, onPickDay }) {
             const { cash } = useCash();
-            const [open, setOpen] = useState(false);
+            const [openState, setOpen] = useState(false);
+            /* Dentro de un grupo el panel va siempre abierto y sin su propio encabezado */
+            const embedded = useContext(EmbedCtx);
+            const open = openState || embedded;
             const weeks = metrics.weeks;
 
             return (
-                <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
+                <section className={embedded ? 'pt-3' : 'bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden'}>
+                    {!embedded && (
                     <button onClick={() => { setOpen(o => !o); feedback.tap(); }} aria-expanded={open}
                             className="focus-ring w-full flex items-center justify-between gap-3 p-4 text-left">
                         <span className="flex items-center gap-2 min-w-0">
@@ -3559,6 +3610,7 @@
                             <IconChevronD size={18} />
                         </span>
                     </button>
+                    )}
 
                     {open && (
                         <div className="px-4 pb-4 space-y-2.5 fade-in">
@@ -3648,6 +3700,7 @@
            15b-6. ANÁLISIS DE VARIACIONES PRESUPUESTARIAS
            ============================================================================ */
         function VariancePanel({ metrics }) {
+            const embedded = useContext(EmbedCtx);
             const { cash } = useCash();
             const v = metrics.variance;
             const deficit = v.total < 0;
@@ -3674,7 +3727,7 @@
             };
 
             return (
-                <section className="bg-slate-900 rounded-2xl border border-slate-800 p-4">
+                <section className={embedded ? 'p-4 pt-3' : 'bg-slate-900 rounded-2xl border border-slate-800 p-4'}>
                     <div className="flex items-start justify-between gap-3 mb-3">
                         <div className="min-w-0">
                             <h2 className="text-slate-100 text-sm font-semibold tracking-tight">Análisis de variaciones</h2>
@@ -3735,7 +3788,10 @@
            15b-7. AUDITOR DE ASIENTOS Y CONTROL INTERNO
            ============================================================================ */
         function AuditorPanel({ flags, onPickDay }) {
-            const [open, setOpen] = useState(false);
+            const [openState, setOpen] = useState(false);
+            /* Dentro de un grupo el panel va siempre abierto y sin su propio encabezado */
+            const embedded = useContext(EmbedCtx);
+            const open = openState || embedded;
             const errors = flags.filter(f => f.severity === 'error').length;
             const warns = flags.filter(f => f.severity === 'warn').length;
 
@@ -3746,7 +3802,8 @@
             };
 
             return (
-                <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
+                <section className={embedded ? 'pt-3' : 'bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden'}>
+                    {!embedded && (
                     <button onClick={() => { setOpen(o => !o); feedback.tap(); }} aria-expanded={open}
                             className="focus-ring w-full flex items-center justify-between gap-3 p-4 text-left">
                         <span className="flex items-center gap-2 min-w-0">
@@ -3766,6 +3823,7 @@
                             <IconChevronD size={18} />
                         </span>
                     </button>
+                    )}
 
                     {open && (
                         <div className="px-4 pb-4 space-y-2 fade-in">
@@ -3796,12 +3854,13 @@
            15c. PACING ADAPTATIVO Y PROYECCIÓN POR PERFIL DE DÍA
            ============================================================================ */
         function PacingStrategyPanel({ metrics, mode, onMode }) {
+            const embedded = useContext(EmbedCtx);
             const { cash } = useCash();
             const { rebalance, projection } = metrics;
             const relief = mode === 'relief';
 
             return (
-                <section className="bg-slate-900 rounded-2xl border border-slate-800 p-4">
+                <section className={embedded ? 'p-4 pt-3' : 'bg-slate-900 rounded-2xl border border-slate-800 p-4'}>
                     <div className="flex items-start justify-between gap-3 mb-3">
                         <div className="min-w-0">
                             <h2 className="text-slate-100 text-sm font-semibold tracking-tight">Estrategia de cuota</h2>
@@ -3979,7 +4038,10 @@
            ============================================================================ */
         function WhatIfPanel({ metrics }) {
             const { cash } = useCash();
-            const [open, setOpen] = useState(false);
+            const [openState, setOpen] = useState(false);
+            /* Dentro de un grupo el panel va siempre abierto y sin su propio encabezado */
+            const embedded = useContext(EmbedCtx);
+            const open = openState || embedded;
             const [fuelDelta, setFuelDelta] = useState(0);
             const [extraDays, setExtraDays] = useState(1);
 
@@ -3989,7 +4051,8 @@
             const deltaTone = scenario.deltaPocket >= 0 ? 'text-emerald-400' : 'text-rose-300';
 
             return (
-                <section className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
+                <section className={embedded ? 'pt-3' : 'bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden'}>
+                    {!embedded && (
                     <button onClick={() => { setOpen(o => !o); haptic(10); }} aria-expanded={open}
                             className="focus-ring w-full flex items-center justify-between gap-3 p-4 text-left">
                         <span className="flex items-center gap-2 min-w-0">
@@ -4005,6 +4068,7 @@
                             <IconChevronD size={18} />
                         </span>
                     </button>
+                    )}
 
                     {open && (
                         <div className="px-4 pb-4 fade-in">
@@ -5697,8 +5761,6 @@
                             ))}
                         </section>
 
-                        <OperationalIntelPanel aggregates={opsAnalytics.aggregates} onPickDay={focusDay} />
-
                         <p className="text-center text-[10px] text-slate-600 pt-2 num">
                             {monthLabel(year, monthIndex)} · guardado en didi_data_{year}_{String(monthIndex + 1).padStart(2, '0')}
                         </p>
@@ -5775,134 +5837,132 @@
                                 <MeterRow label="Progreso sobre meta mensual" value={metrics.goalProgress}
                                           display={`${pctText(metrics.goalProgress, 1)} · ${cash(metrics.totalEarned, 0)} / ${cash(metrics.totalGoal, 0)}`}
                                           color="bg-emerald-500" />
-                                <MeterRow label="Retención de combustible" value={metrics.fuelRetention}
-                                          display={`${pctText(metrics.fuelRetention, 1)} del depósito`}
-                                          color={metrics.fuelRetention <= 25 ? 'bg-sky-500' : metrics.fuelRetention <= 40 ? 'bg-amber-500' : 'bg-rose-500'} />
                                 <MeterRow label="Efectividad de jornadas" value={metrics.effectiveness}
                                           display={`${metrics.achievedDays} de ${metrics.workedDays} · ${pctText(metrics.effectiveness, 0)}`}
                                           color="bg-violet-500" />
                             </div>
-                        </section>
 
-                        {/* ---------- Pacing ---------- */}
-                        <section className={`rounded-2xl border p-4 ${
-                            metrics.goalGap > 0 ? 'bg-slate-900 border-slate-800' : 'bg-emerald-950/25 border-emerald-800/50'}`}>
-                            <div className="flex items-center justify-between gap-3">
-                                <div className="min-w-0">
-                                    <p className="text-[10px] uppercase tracking-[0.14em] text-slate-300 font-bold">
-                                        {metrics.goalGap > 0
-                                            ? (meta.pacingMode === 'record' ? 'Cuota diaria del modo récord' : 'Cuota diaria con alivio')
-                                            : 'Meta mensual superada'}
-                                    </p>
-                                    <p className={`text-2xl font-bold num mt-1 ${
-                                        metrics.goalGap > 0 ? 'text-sky-300' : 'text-emerald-400'} ${stealth ? 'stealth-blur' : ''}`}>
-                                        {metrics.goalGap > 0
-                                            ? cash(meta.pacingMode === 'record'
-                                                ? metrics.rebalance.originalDaily
-                                                : metrics.rebalance.reliefDaily, 0)
-                                            : `+${cash(Math.abs(metrics.goalGap), 0)}`}
-                                    </p>
-                                    <p className="text-[11px] text-slate-500 num mt-0.5">
-                                        {metrics.goalGap > 0
-                                            ? `Para cerrar ${cash(metrics.goalGap, 0)} en ${metrics.remainingDays} ${metrics.remainingDays === 1 ? 'día libre' : 'días libres'}`
-                                            : 'Sin brecha pendiente este mes'}
-                                    </p>
-                                </div>
-                                <span className={`shrink-0 ${metrics.goalGap > 0 ? 'text-sky-400' : 'text-emerald-400'}`}>
-                                    <IconTarget size={30} strokeWidth={1.4} />
-                                </span>
+                            {/* Economía unitaria: lo que no se repite en el resto del tablero */}
+                            <div className="grid grid-cols-3 gap-2 mt-4 pt-4 border-t border-slate-800">
+                                <UnitStat label="Bolsillo proyectado" masked={stealth} tone="info"
+                                          value={cash(metrics.projection.projectedPocket, 0)}
+                                          sub={`Depósito ${cash(metrics.projection.projected, 0)}`} />
+                                <UnitStat label="Bolsillo por hora" masked={stealth}
+                                          value={metrics.pocketPerHour !== null ? cash(metrics.pocketPerHour, 0) : '—'}
+                                          sub={metrics.totalHours > 0 ? `${money(metrics.totalHours, 0)} h al volante` : 'Captura horas'} />
+                                <UnitStat label="Gasto por km" masked={stealth}
+                                          value={metrics.cashPerKm !== null ? cash(metrics.cashPerKm) : '—'}
+                                          sub={metrics.totalKm > 0 ? `${money(metrics.totalKm, 0)} km` : 'Captura km'} />
                             </div>
                         </section>
 
-                        {/* ---------- Tacómetro de pacing ---------- */}
-                        <section className="bg-slate-900 rounded-2xl border border-slate-800 p-4">
-                            <div className="flex items-start justify-between gap-3 mb-1">
-                                <div className="min-w-0">
-                                    <h2 className="text-slate-100 text-sm font-semibold tracking-tight">Eficiencia de pacing</h2>
-                                    <p className="text-slate-500 text-[11px]">Avance de meta contra avance del calendario</p>
-                                </div>
-                                <StatPill label="Día" value={`${elapsedDays}/${totalDays}`} tone="sky" />
-                            </div>
-                            <RadialGauge value={clamp(metrics.pacing.efficiency, 0, 100)}
-                                         centerLabel={`${Math.round(metrics.pacing.efficiency)}%`}
-                                         caption="Pacing"
-                                         tone={metrics.pacing.efficiency >= 80 ? 'emerald'
-                                             : metrics.pacing.efficiency >= 55 ? 'amber' : 'rose'}
-                                         footnote={`Meta ${pctText(metrics.goalProgress, 0)} · calendario ${pctText(metrics.pacing.elapsedRatio, 0)}`} />
-                            <p className={`text-center text-[12px] font-bold mt-2 ${
-                                metrics.pacing.efficiency >= 100 ? 'text-emerald-400'
-                                : metrics.pacing.efficiency >= 80 ? 'text-emerald-400/80'
-                                : metrics.pacing.efficiency >= 55 ? 'text-amber-400' : 'text-rose-400'}`}>
-                                {metrics.pacing.verdict}
-                            </p>
-                        </section>
+                        {/* ---------- Meta y ritmo: cuota, pacing, curva y variaciones ---------- */}
+                        <Bundle id="meta"
+                                icon={<IconTarget size={16} />}
+                                title={metrics.goalGap > 0 ? 'Meta y ritmo' : 'Meta mensual superada'}
+                                subtitle={metrics.goalGap > 0
+                                    ? `${meta.pacingMode === 'record' ? 'Cuota récord' : 'Cuota con alivio'} ${stealth ? '•••' : cash(meta.pacingMode === 'record'
+                                        ? metrics.rebalance.originalDaily : metrics.rebalance.reliefDaily, 0)}/día · faltan ${stealth ? '•••' : cash(metrics.goalGap, 0)} en ${metrics.remainingDays} ${metrics.remainingDays === 1 ? 'día' : 'días'}`
+                                    : `+${stealth ? '•••' : cash(Math.abs(metrics.goalGap), 0)} sobre la meta`}
+                                action={<StatPill label="Día" value={`${elapsedDays}/${totalDays}`} tone="sky" />}
+                                tabs={[
+                                    { id: 'ritmo', label: 'Ritmo', render: () => (
+                                        <>
+                                            <div className="px-4 pt-3">
+                                                <RadialGauge value={clamp(metrics.pacing.efficiency, 0, 100)}
+                                                             centerLabel={`${Math.round(metrics.pacing.efficiency)}%`}
+                                                             caption="Pacing"
+                                                             tone={metrics.pacing.efficiency >= 80 ? 'emerald'
+                                                                 : metrics.pacing.efficiency >= 55 ? 'amber' : 'rose'}
+                                                             footnote={`Meta ${pctText(metrics.goalProgress, 0)} · calendario ${pctText(metrics.pacing.elapsedRatio, 0)}`} />
+                                                <p className={`text-center text-[12px] font-bold mt-2 ${
+                                                    metrics.pacing.efficiency >= 100 ? 'text-emerald-400'
+                                                    : metrics.pacing.efficiency >= 80 ? 'text-emerald-400/80'
+                                                    : metrics.pacing.efficiency >= 55 ? 'text-amber-400' : 'text-rose-400'}`}>
+                                                    {metrics.pacing.verdict}
+                                                </p>
+                                            </div>
+                                            <CumulativeChart days={deferredList} metrics={deferredMetrics}
+                                                             todayIndex={today.index} prediction={prediction} />
+                                        </>
+                                    ) },
+                                    { id: 'cuota', label: 'Cuota', render: () => (
+                                        <PacingStrategyPanel metrics={metrics}
+                                                             mode={meta.pacingMode === 'record' ? 'record' : 'relief'}
+                                                             onMode={setPacingMode} />
+                                    ) },
+                                    { id: 'variaciones', label: 'Variaciones', render: () => <VariancePanel metrics={metrics} /> }
+                                ]} />
 
-                        {/* ---------- Rejilla de métricas ---------- */}
-                        <section className="grid grid-cols-2 gap-2">
-                            <MetricTile icon={<IconTarget size={13} />} label="Meta mensual" masked={stealth}
-                                        value={cash(metrics.totalGoal, 0)} sub={`${metrics.goalDays} días con meta`} />
-                            <MetricTile icon={<IconCheck size={13} />} label="Descansos ganados" masked={stealth}
-                                        tone={metrics.rebalance.earnedRest > 0 ? 'positive' : 'neutral'}
-                                        value={`${metrics.rebalance.earnedRest}`}
-                                        sub={metrics.rebalance.ahead
-                                            ? `Excedente ${cash(metrics.rebalance.surplusNow, 0)}`
-                                            : 'Sin excedente aún'} />
-                            <MetricTile icon={<IconWallet size={13} />} label="Depositado" tone="positive" masked={stealth}
-                                        value={cash(metrics.totalEarned)} sub={`Prom. ${cash(metrics.avgEarned, 0)} / jornada`} />
-                            <MetricTile icon={<IconFuel size={13} />} label="Gasolina" tone="negative" masked={stealth}
-                                        value={cash(metrics.totalGas)} sub={`${pctText(metrics.fuelRetention, 1)} del depósito`} />
-                            <MetricTile icon={<IconRoute size={13} />} label="Gastos de ruta" tone="warning" masked={stealth}
-                                        value={cash(metrics.totalRouteCash)}
-                                        sub={`Casetas, lavado y varios`} />
-                            <MetricTile icon={<IconTrend size={13} />} label="Proyección por perfil" tone="info" masked={stealth}
-                                        value={cash(metrics.projection.projected, 0)}
-                                        sub={`${metrics.projection.fromHistory} días con historia`} />
-                            <MetricTile icon={<IconTrend size={13} />} label="Bolsillo proyectado" tone="info" masked={stealth}
-                                        value={cash(metrics.projection.projectedPocket, 0)}
-                                        sub={`Retorno ${pctText(metrics.returnRate, 0)}`} />
-                            <MetricTile icon={<IconClock size={13} />} label="Bolsillo por hora" masked={stealth}
-                                        tone={metrics.pocketPerHour !== null && metrics.pocketPerHour > 0 ? 'positive' : 'neutral'}
-                                        value={metrics.pocketPerHour !== null ? cash(metrics.pocketPerHour) : '—'}
-                                        sub={metrics.totalHours > 0 ? `${money(metrics.totalHours, 1)} h al volante` : 'Captura horas en el detalle'} />
-                            <MetricTile icon={<IconRoute size={13} />} label="Gasto por km" masked={stealth}
-                                        value={metrics.cashPerKm !== null ? cash(metrics.cashPerKm) : '—'}
-                                        sub={metrics.totalKm > 0 ? `${money(metrics.totalKm, 0)} km recorridos` : 'Captura km en el detalle'} />
-                        </section>
-
-                            <IncomeStatementPanel metrics={metrics} basis={basis} onBasis={setAccountingBasis} />
-
-                        <VariancePanel metrics={metrics} />
-
-                        <SettlementPanel metrics={metrics} settlements={settlements}
-                                         onSettlement={updateSettlement} onPickDay={focusDay} />
-
-                        <AuditorPanel flags={deferredMetrics.auditFlags} onPickDay={focusDay} />
-
-                        <PacingStrategyPanel metrics={metrics}
-                                             mode={meta.pacingMode === 'record' ? 'record' : 'relief'}
-                                             onMode={setPacingMode} />
-
-                            <CumulativeChart days={deferredList} metrics={deferredMetrics}
-                                         todayIndex={today.index} prediction={prediction} />
+                        {/* ---------- Contabilidad: resultados, cortes y auditoría ---------- */}
+                        <Bundle id="contabilidad"
+                                icon={<IconClipboard size={16} />}
+                                title="Contabilidad"
+                                subtitle={`Margen ${pctText(metrics.contributionRatio, 1)} · ${metrics.weeks.length} cortes · ${
+                                    deferredMetrics.auditFlags.length === 0 ? 'sin observaciones'
+                                    : `${deferredMetrics.auditFlags.length} ${deferredMetrics.auditFlags.length === 1 ? 'observación' : 'observaciones'}`}`}
+                                tabs={[
+                                    { id: 'resultados', label: 'Resultados', render: () => (
+                                        <IncomeStatementPanel metrics={metrics} basis={basis} onBasis={setAccountingBasis} />
+                                    ) },
+                                    { id: 'cortes', label: 'Cortes', render: () => (
+                                        <SettlementPanel metrics={metrics} settlements={settlements}
+                                                         onSettlement={updateSettlement} onPickDay={focusDay} />
+                                    ) },
+                                    { id: 'auditoria', label: 'Auditoría', count: deferredMetrics.auditFlags.length, countTone: 'warn', render: () => (
+                                        <AuditorPanel flags={deferredMetrics.auditFlags} onPickDay={focusDay} />
+                                    ) }
+                                ]} />
                         </div>
                         )}
 
                         {/* ================= PESTAÑA: INTELIGENCIA ================= */}
                         {mountedTabs.inteligencia && (
                         <div style={{ display: tab === 'inteligencia' ? 'block' : 'none' }} className="space-y-3">
-                            <PredictivePanel prediction={prediction} metrics={deferredMetrics}
-                                         samples={grossSamples} targetDaily={targetDaily} />
+                        {/* ---------- Pronóstico: Monte Carlo y simulador de escenarios ---------- */}
+                        <Bundle id="pronostico"
+                                icon={<IconTrend size={16} />}
+                                title="Pronóstico y escenarios"
+                                subtitle={prediction.monteCarlo.runs > 0
+                                    ? `${prediction.monteCarlo.probability.toFixed(0)}% de probabilidad de cerrar la meta`
+                                    : 'Registra jornadas para simular el cierre'}
+                                tabs={[
+                                    { id: 'montecarlo', label: 'Pronóstico', render: () => (
+                                        <PredictivePanel prediction={prediction} metrics={deferredMetrics}
+                                                         samples={grossSamples} targetDaily={targetDaily} />
+                                    ) },
+                                    { id: 'simulador', label: 'Simulador', render: () => <WhatIfPanel metrics={deferredMetrics} /> }
+                                ]} />
 
-                        <WhatIfPanel metrics={deferredMetrics} />
-
-                            <ProductivityHeatmap days={deferredList} computed={deferredMetrics.computed}
-                                             year={year} monthIndex={monthIndex}
-                                             todayId={today.id} onPickDay={focusDay} />
-
-                        <WeekdayPerformance weekdayStats={deferredMetrics.weekdayStats}
-                                            bestWeekday={deferredMetrics.bestWeekday} />
-
-                        <SpcPanel spc={deferredMetrics.spc} outliers={outliers} onPickDay={focusDay} />
+                        {/* ---------- Rendimiento: IRD, perfil semanal, calendario y variabilidad ---------- */}
+                        <Bundle id="rendimiento"
+                                icon={<IconStats size={16} />}
+                                title="Rendimiento operativo"
+                                subtitle={opsAnalytics.aggregates.star
+                                    ? `Día estrella ${opsAnalytics.aggregates.star.label} · Score ${opsAnalytics.aggregates.star.ird.score}/100`
+                                    : 'Captura el tablero DiDi en tus jornadas'}
+                                tabs={[
+                                    { id: 'resumen', label: 'Resumen', render: () => (
+                                        <OperationalIntelPanel aggregates={opsAnalytics.aggregates} onPickDay={focusDay} view="summary" />
+                                    ) },
+                                    { id: 'semana', label: 'Semana', render: () => (
+                                        <>
+                                            <WeekdayPerformance weekdayStats={deferredMetrics.weekdayStats}
+                                                                bestWeekday={deferredMetrics.bestWeekday} />
+                                            <div className="-mt-4">
+                                                <OperationalIntelPanel aggregates={opsAnalytics.aggregates} onPickDay={focusDay} view="weekday" />
+                                            </div>
+                                        </>
+                                    ) },
+                                    { id: 'calendario', label: 'Mapa', render: () => (
+                                        <ProductivityHeatmap days={deferredList} computed={deferredMetrics.computed}
+                                                             year={year} monthIndex={monthIndex}
+                                                             todayId={today.id} onPickDay={focusDay} />
+                                    ) },
+                                    { id: 'variabilidad', label: 'Dispersión', count: outliers.length, render: () => (
+                                        <SpcPanel spc={deferredMetrics.spc} outliers={outliers} onPickDay={focusDay} />
+                                    ) }
+                                ]} />
                         </div>
                         )}
 
