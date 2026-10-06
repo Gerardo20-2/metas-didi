@@ -5643,6 +5643,15 @@
 
             const todayDay = today.id ? list.find(d => d.id === today.id) : null;
 
+            /* Saludo según la hora: da contexto rápido del turno al abrir la app */
+            const greeting = (() => {
+                const now = new Date();
+                const h = now.getHours();
+                const [icon, text] = h < 6 ? ['🌙', 'Turno nocturno'] : h < 12 ? ['☀️', 'Buenos días'] : h < 19 ? ['🌤️', 'Buenas tardes'] : ['🌆', 'Buenas noches'];
+                const date = now.toLocaleDateString('es-MX', { weekday: 'short', day: 'numeric', month: 'short' });
+                return { icon, text, date: date.charAt(0).toUpperCase() + date.slice(1) };
+            })();
+
             /* ---------- Render ---------- */
             return (
                 <CashCtx.Provider value={cashValue}>
@@ -5655,9 +5664,15 @@
                             <div className="flex items-center justify-between gap-2">
                                 <div className="flex items-center gap-2 min-w-0">
                                     <span className="text-emerald-400 shrink-0"><IconGauge size={18} /></span>
-                                    <h1 className="text-slate-100 font-bold tracking-tight text-[15px] leading-none truncate">
-                                        Telemetría DiDi <span className="text-emerald-400">Pro</span>
-                                    </h1>
+                                    <div className="min-w-0">
+                                        <h1 className="text-slate-100 font-bold tracking-tight text-[15px] leading-none truncate">
+                                            Telemetría DiDi <span className="text-emerald-400">Pro</span>
+                                            <span className="ml-1.5 align-middle rounded-full border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-[9px] font-bold text-emerald-300 tracking-normal">v1.1</span>
+                                        </h1>
+                                        <p className="mt-1 text-[11px] leading-none text-slate-400 truncate">
+                                            {greeting.icon} {greeting.text} · {greeting.date}
+                                        </p>
+                                    </div>
                                 </div>
                                 <div className="flex items-center gap-1.5 shrink-0">
                                     <button onClick={toggleStealth} aria-pressed={stealth}
